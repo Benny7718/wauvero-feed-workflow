@@ -7,7 +7,12 @@
 	"name": "wauvero-feed-workflow",
 	"main": "worker/index.ts",
 	"compatibility_date": "2025-10-08",
-	"assets": {
+
+"limits": {
+  "cpu_ms": 300000
+},
+
+"assets": {
 		"directory": "./dist",
 		"not_found_handling": "single-page-application"
 	},
