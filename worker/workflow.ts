@@ -12,22 +12,9 @@ type FeedSource = {
 
 type FeedRow = Record<string, string>;
 
-type DbRow = {
-	key: string;
-	ean: string | null;
-	brand: string | null;
-	name: string;
-	category: string | null;
-	mpid: string;
-	url: string | null;
-	affiliate: string | null;
-	image: string | null;
-	currency: string;
-	price: number;
-	shipping: number;
-	total: number;
-	available: number;
-	updated: string | null;
+type ParsedChunk = {
+	rows: FeedRow[];
+	remainder: string;
 };
 
 function normalize(value: string | undefined): string {
@@ -53,10 +40,10 @@ function moneyToCents(value: string | undefined): number {
 		normalized = raw.replace(/\./g, "").replace(",", ".");
 	}
 
-	const n = Number.parseFloat(normalized);
+	const number = Number.parseFloat(normalized);
 
-	return Number.isFinite(n)
-		? Math.max(0, Math.round(n * 100))
+	return Number.isFinite(number)
+		? Math.max(0, Math.round(number * 100))
 		: 0;
 }
 
@@ -76,80 +63,169 @@ function isAvailable(value: string | undefined): number {
 		: 1;
 }
 
-function parseCsvRecord(record: string): string[] {
-	const result: string[] = [];
-	let current = "";
-	let quoted = false;
-
-	for (let i = 0; i < record.length; i++) {
-		const c = record[i];
-
-		if (c === '"') {
-			if (quoted && record[i + 1] === '"') {
-				current += '"';
-				i++;
-			} else {
-				quoted = !quoted;
-			}
-			continue;
-		}
-
-		if (c === "," && !quoted) {
-			result.push(current);
-			current = "";
-			continue;
-		}
-
-		current += c;
-	}
-
-	result.push(current);
-	return result;
-}
-
-function splitRecords(text: string): {
+/**
+ * Robuster CSV-Parser.
+ *
+ * Wichtig:
+ * - unterstützt quoted fields
+ * - unterstützt Kommas innerhalb von Quotes
+ * - unterstützt doppelte Quotes ("")
+ * - unterstützt CRLF und LF
+ * - verarbeitet keine unvollständigen Datensätze
+ */
+function parseCsvRecords(
+	text: string,
+	finalChunk: boolean,
+): {
 	records: string[];
 	remainder: string;
 } {
 	const records: string[] = [];
 
-	let start = 0;
+	let field = "";
+	let record: string[] = [];
 	let quoted = false;
+	let quoteJustClosed = false;
+
+	const pushField = () => {
+		record.push(field);
+		field = "";
+	};
+
+	const pushRecord = () => {
+		if (record.length > 0 || field.length > 0) {
+			pushField();
+			records.push(record.join("\u0001"));
+			record = [];
+		}
+	};
 
 	for (let i = 0; i < text.length; i++) {
 		const c = text[i];
 
-		if (c === '"') {
-			if (quoted && text[i + 1] === '"') {
-				i++;
+		if (quoted) {
+			if (c === '"') {
+				if (text[i + 1] === '"') {
+					field += '"';
+					i++;
+				} else {
+					quoted = false;
+					quoteJustClosed = true;
+				}
 			} else {
-				quoted = !quoted;
+				field += c;
 			}
+
 			continue;
 		}
 
-		if ((c === "\n" || c === "\r") && !quoted) {
-			records.push(text.slice(start, i));
+		if (quoteJustClosed) {
+			if (c === ",") {
+				pushField();
+				quoteJustClosed = false;
+				continue;
+			}
+
+			if (c === "\r" || c === "\n") {
+				pushRecord();
+				quoteJustClosed = false;
+
+				if (c === "\r" && text[i + 1] === "\n") {
+					i++;
+				}
+
+				continue;
+			}
+
+			/*
+			 * Whitespace nach einem geschlossenen Quote
+			 * tolerieren.
+			 */
+			if (/\s/.test(c)) {
+				continue;
+			}
+
+			quoteJustClosed = false;
+			field += c;
+			continue;
+		}
+
+		if (c === '"') {
+			quoted = true;
+			continue;
+		}
+
+		if (c === ",") {
+			pushField();
+			continue;
+		}
+
+		if (c === "\r" || c === "\n") {
+			pushRecord();
 
 			if (c === "\r" && text[i + 1] === "\n") {
 				i++;
 			}
 
-			start = i + 1;
+			continue;
 		}
+
+		field += c;
+	}
+
+	/*
+	 * Wenn der Chunk mitten in einem quoted field endet,
+	 * muss der komplette aktuelle Datensatz erhalten bleiben.
+	 */
+	if (quoted || quoteJustClosed || record.length > 0 || field.length > 0) {
+		const partial = [
+			...record,
+			field,
+		].join(",");
+
+		if (finalChunk) {
+			if (quoted) {
+				throw new Error(
+					"CSV endet mit einem nicht geschlossenen Textfeld.",
+				);
+			}
+
+			if (partial.trim()) {
+				records.push(partial);
+			}
+
+			return {
+				records,
+				remainder: "",
+			};
+		}
+
+		return {
+			records,
+			remainder: partial,
+		};
 	}
 
 	return {
 		records,
-		remainder: text.slice(start),
+		remainder: "",
 	};
+}
+
+function valuesFromRecord(record: string): string[] {
+	/*
+	 * parseCsvRecords verwendet \u0001 nur intern
+	 * als Feldtrenner. Das Zeichen wird hier wieder
+	 * in echte Feldwerte zerlegt.
+	 */
+	return record.split("\u0001");
 }
 
 function rowFromRecord(
 	record: string,
 	headers: string[],
 ): FeedRow {
-	const values = parseCsvRecord(record);
+	const values = valuesFromRecord(record);
 	const row: FeedRow = {};
 
 	for (let i = 0; i < headers.length; i++) {
@@ -162,13 +238,15 @@ function rowFromRecord(
 function getMpid(row: FeedRow): string {
 	return (
 		normalize(row.merchant_product_id) ||
-		normalize(row.aw_product_id)
+		normalize(row.aw_product_id) ||
+		normalize(row.product_id)
 	);
 }
 
 function getEan(row: FeedRow): string | null {
 	const value =
 		normalize(row.product_GTIN) ||
+		normalize(row.gtin) ||
 		normalize(row.ean);
 
 	return value || null;
@@ -176,40 +254,58 @@ function getEan(row: FeedRow): string | null {
 
 function getName(row: FeedRow): string {
 	return (
-		normalize(row.product_short_description) ||
 		normalize(row.product_name) ||
-		normalize(row.description) ||
-		"Unbekanntes Produkt"
+		normalize(row.product_short_description) ||
+		normalize(row.name) ||
+		""
+	);
+}
+
+function getDescription(row: FeedRow): string {
+	return (
+		normalize(row.product_short_description) ||
+		normalize(row.description)
 	);
 }
 
 function getBrand(row: FeedRow): string | null {
-	const value = normalize(row.brand_name);
+	const value =
+		normalize(row.brand_name) ||
+		normalize(row.brand);
+
 	return value || null;
 }
 
 function getCategory(row: FeedRow): string | null {
-	const value = normalize(row.merchant_category);
+	const value =
+		normalize(row.merchant_category) ||
+		normalize(row.category_name);
+
 	return value || null;
 }
 
 function getProductUrl(row: FeedRow): string | null {
 	const value =
 		normalize(row.merchant_deep_link) ||
-		normalize(row.aw_deep_link);
+		normalize(row.aw_deep_link) ||
+		normalize(row.product_url);
 
 	return value || null;
 }
 
 function getAffiliateUrl(row: FeedRow): string | null {
-	const value = normalize(row.aw_deep_link);
+	const value =
+		normalize(row.aw_deep_link) ||
+		normalize(row.merchant_deep_link);
+
 	return value || null;
 }
 
 function getImageUrl(row: FeedRow): string | null {
 	const value =
 		normalize(row.merchant_image_url) ||
-		normalize(row.aw_image_url);
+		normalize(row.aw_image_url) ||
+		normalize(row.image_url);
 
 	return value || null;
 }
@@ -219,7 +315,10 @@ function getCurrency(row: FeedRow): string {
 }
 
 function getUpdated(row: FeedRow): string | null {
-	const value = normalize(row.last_updated);
+	const value =
+		normalize(row.last_updated) ||
+		normalize(row.updated_at);
+
 	return value || null;
 }
 
@@ -240,31 +339,103 @@ function isDogProduct(row: FeedRow): boolean {
 	].join(" ");
 
 	const text = [
-		row.product_short_description,
 		row.product_name,
+		row.product_short_description,
 		row.description,
 		row.product_type,
 		row.keywords,
+		category,
 	].join(" ");
 
 	if (
-		/\b(katze|katzen|cat|feline|katzenfutter)\b/i.test(
-			category,
-		)
-	) {
-		return false;
-	}
-
-	if (
-		/\b(hund|hunde|dog|canine)\b/i.test(category) ||
-		/\b(hundefutter|hundesnack|hundesnacks|kauartikel|kausnack|kausnacks|leckerli|trockenfutter|nassfutter|barf)\b/i.test(
+		/\b(katze|katzen|cat|feline|katzenfutter|katzenbedarf)\b/i.test(
 			text,
 		)
 	) {
-		return true;
+		if (
+			!/\b(hund|hunde|dog|canine|hundefutter|hundesnack|kauartikel)\b/i.test(
+				text,
+			)
+		) {
+			return false;
+		}
 	}
 
-	return false;
+	return /\b(
+		hund|
+		hunde|
+		dog|
+		canine|
+		hundefutter|
+		hundesnack|
+		hundesnacks|
+		kauartikel|
+		kausnack|
+		kausnacks|
+		leckerli|
+		trockenfutter|
+		nassfutter|
+		barf
+	)\b/ix.test(text);
+}
+
+function prepareRows(
+	rows: FeedRow[],
+): DbRow[] {
+	const map = new Map<string, DbRow>();
+
+	for (const row of rows) {
+		const mpid = getMpid(row);
+
+		if (!mpid) continue;
+
+		const name = getName(row);
+
+		/*
+		 * Ein Datensatz, bei dem der Produktname offensichtlich
+		 * eine Beschreibung ist, wird nicht importiert.
+		 */
+		if (
+			!name ||
+			name.length > 500
+		) {
+			continue;
+		}
+
+		const price = moneyToCents(
+			row.search_price ||
+				row.display_price ||
+				row.price,
+		);
+
+		if (price <= 0) continue;
+
+		const shipping = moneyToCents(
+			row.delivery_cost ||
+				row.shipping_cost ||
+				row.shipping,
+		);
+
+		map.set(mpid, {
+			key: canonicalKey(row),
+			ean: getEan(row),
+			brand: getBrand(row),
+			name,
+			category: getCategory(row),
+			mpid,
+			url: getProductUrl(row),
+			affiliate: getAffiliateUrl(row),
+			image: getImageUrl(row),
+			currency: getCurrency(row),
+			price,
+			shipping,
+			total: price + shipping,
+			available: isAvailable(row.in_stock),
+			updated: getUpdated(row),
+		});
+	}
+
+	return Array.from(map.values());
 }
 
 async function findFeed(
@@ -282,8 +453,8 @@ async function findFeed(
 		});
 
 		objects.push(
-			...page.objects.filter((o) =>
-				o.key.toLowerCase().endsWith(".csv"),
+			...page.objects.filter((object) =>
+				object.key.toLowerCase().endsWith(".csv"),
 			),
 		);
 
@@ -368,7 +539,7 @@ async function readHeader(
 	let headerBytes = bytes.slice(0, newline);
 
 	if (
-		headerBytes.length > 0 &&
+		headerBytes.length &&
 		headerBytes[headerBytes.length - 1] === 13
 	) {
 		headerBytes = headerBytes.slice(0, -1);
@@ -379,55 +550,33 @@ async function readHeader(
 		ignoreBOM: false,
 	}).decode(headerBytes);
 
-	return {
-		headers: parseCsvRecord(
-			header.replace(/^\uFEFF/, ""),
-		).map((v) => v.trim()),
-		offset: newline + 1,
-	};
-}
+	const parsed = parseCsvRecords(
+		header,
+		true,
+	);
 
-function prepareRows(
-	rows: FeedRow[],
-): DbRow[] {
-	const map = new Map<string, DbRow>();
-
-	for (const row of rows) {
-		const mpid = getMpid(row);
-
-		if (!mpid) continue;
-
-		const price = moneyToCents(
-			row.search_price ||
-				row.display_price,
+	if (parsed.records.length !== 1) {
+		throw new Error(
+			"CSV-Header konnte nicht eindeutig gelesen werden.",
 		);
-
-		if (price <= 0) continue;
-
-		const shipping = moneyToCents(
-			row.delivery_cost,
-		);
-
-		map.set(mpid, {
-			key: canonicalKey(row),
-			ean: getEan(row),
-			brand: getBrand(row),
-			name: getName(row),
-			category: getCategory(row),
-			mpid,
-			url: getProductUrl(row),
-			affiliate: getAffiliateUrl(row),
-			image: getImageUrl(row),
-			currency: getCurrency(row),
-			price,
-			shipping,
-			total: price + shipping,
-			available: isAvailable(row.in_stock),
-			updated: getUpdated(row),
-		});
 	}
 
-	return Array.from(map.values());
+	const headers = valuesFromRecord(
+		parsed.records[0],
+	).map((value) =>
+		value.trim(),
+	);
+
+	if (headers.length < 2) {
+		throw new Error(
+			"CSV-Header ist ungültig.",
+		);
+	}
+
+	return {
+		headers,
+		offset: newline + 1,
+	};
 }
 
 async function processChunk(
@@ -442,17 +591,18 @@ async function processChunk(
 	remainder: string;
 	found: number;
 	imported: number;
-	done: boolean;
 }> {
+	const length = Math.min(
+		CHUNK_SIZE,
+		source.size - offset,
+	);
+
 	const object = await env.FEED_BUCKET.get(
 		source.key,
 		{
 			range: {
 				offset,
-				length: Math.min(
-					CHUNK_SIZE,
-					source.size - offset,
-				),
+				length,
 			},
 		},
 	);
@@ -474,41 +624,45 @@ async function processChunk(
 	}
 
 	let text = "";
-
-	let decoded = false;
+	let decodedLength = bytes.length;
 
 	for (let trim = 0; trim <= 3; trim++) {
 		try {
+			const lengthToDecode =
+				bytes.length - trim;
+
 			text = new TextDecoder("utf-8", {
 				fatal: true,
 				ignoreBOM: false,
 			}).decode(
 				bytes.slice(
 					0,
-					bytes.length - trim,
+					lengthToDecode,
 				),
 			);
 
-			decoded = true;
+			decodedLength = lengthToDecode;
 			break;
 		} catch {
-			// trailing UTF-8 bytes
+			if (trim === 3) {
+				throw new Error(
+					`UTF-8-Dekodierung bei Offset ${offset} fehlgeschlagen.`,
+				);
+			}
 		}
 	}
 
-	if (!decoded) {
-		throw new Error(
-			`UTF-8-Dekodierung bei Offset ${offset} fehlgeschlagen.`,
-		);
-	}
+	const finalChunk =
+		offset + bytes.length >= source.size;
 
-	const split = splitRecords(
+	const parsed = parseCsvRecords(
 		remainder + text,
+		finalChunk,
 	);
 
-	const feedRows: FeedRow[] = [];
+	const rows: FeedRow[] = [];
 
-	for (const record of split.records) {
+	for (const record of parsed.records) {
 		if (!record.trim()) continue;
 
 		const row = rowFromRecord(
@@ -517,14 +671,28 @@ async function processChunk(
 		);
 
 		if (isDogProduct(row)) {
-			feedRows.push(row);
+			rows.push(row);
 		}
 	}
 
-	const rows = prepareRows(feedRows);
+	const dbRows = prepareRows(rows);
 
-	if (rows.length > 0) {
-		const json = JSON.stringify(rows);
+	/*
+	 * D1-Lastbegrenzung:
+	 * Ein Chunk wird in kleinen Batches verarbeitet.
+	 * Keine SELECT-Abfrage pro Produkt.
+	 */
+	for (
+		let start = 0;
+		start < dbRows.length;
+		start += 100
+	) {
+		const batchRows = dbRows.slice(
+			start,
+			start + 100,
+		);
+
+		const json = JSON.stringify(batchRows);
 
 		await env.DB.batch([
 			env.DB.prepare(`
@@ -732,8 +900,7 @@ async function processChunk(
 					price_cents,
 					shipping_cents,
 					total_price_cents,
-					available,
-					recorded_at
+					available
 				)
 				SELECT
 					mp.id,
@@ -760,8 +927,7 @@ async function processChunk(
 							j.value,
 							'$.available'
 						) AS INTEGER
-					),
-					CURRENT_TIMESTAMP
+					)
 				FROM json_each(?) j
 				JOIN merchant_products mp
 					ON
@@ -771,46 +937,6 @@ async function processChunk(
 								j.value,
 								'$.mpid'
 							)
-				WHERE NOT EXISTS (
-					SELECT 1
-					FROM price_history h
-					WHERE
-						h.merchant_product_id =
-							mp.id
-						AND h.price_cents =
-							CAST(
-								json_extract(
-									j.value,
-									'$.price'
-								) AS INTEGER
-							)
-						AND h.shipping_cents =
-							CAST(
-								json_extract(
-									j.value,
-									'$.shipping'
-								) AS INTEGER
-							)
-						AND h.total_price_cents =
-							CAST(
-								json_extract(
-									j.value,
-									'$.total'
-								) AS INTEGER
-							)
-						AND h.available =
-							CAST(
-								json_extract(
-									j.value,
-									'$.available'
-								) AS INTEGER
-							)
-						AND h.recorded_at >=
-							datetime(
-								'now',
-								'-1 hour'
-							)
-				)
 			`).bind(
 				json,
 				merchantId,
@@ -818,19 +944,18 @@ async function processChunk(
 		]);
 	}
 
-	const nextOffset = Math.min(
-		source.size,
-		offset + bytes.length,
-	);
-
 	return {
-		nextOffset,
-		remainder: split.remainder,
-		found: feedRows.length,
-		imported: rows.length,
-		done:
-			nextOffset >= source.size &&
-			split.remainder.length === 0,
+		nextOffset:
+			Math.min(
+				source.size,
+				offset + decodedLength,
+			),
+		remainder:
+			parsed.remainder,
+		found:
+			rows.length,
+		imported:
+			dbRows.length,
 	};
 }
 
@@ -915,16 +1040,16 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 
 			let offset = header.offset;
 			let remainder = "";
+			let chunkNumber = 0;
 			let totalFound = 0;
 			let totalImported = 0;
-			let chunk = 0;
 
 			while (
 				offset < source.size ||
 				remainder.length > 0
 			) {
 				const result = await step.do(
-					`import chunk ${chunk + 1}`,
+					`process Fressnapf chunk ${chunkNumber + 1}`,
 					() =>
 						processChunk(
 							this.env,
@@ -938,10 +1063,10 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 
 				if (
 					result.nextOffset <= offset &&
-					!result.done
+					result.remainder === remainder
 				) {
 					throw new Error(
-						`Import-Fortschritt steht bei Offset ${offset}.`,
+						`Feed-Import macht keinen Fortschritt bei Offset ${offset}.`,
 					);
 				}
 
@@ -951,10 +1076,10 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 				totalFound += result.found;
 				totalImported += result.imported;
 
-				chunk++;
+				chunkNumber++;
 
 				await step.do(
-					`update import progress ${chunk}`,
+					`update import ${chunkNumber}`,
 					async () => {
 						await this.env.DB
 							.prepare(`
@@ -975,10 +1100,6 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 							.run();
 					},
 				);
-
-				if (result.done) {
-					break;
-				}
 			}
 
 			await step.do(
@@ -1010,7 +1131,8 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 			return {
 				success: true,
 				importId,
-				chunks: chunk,
+				feed: source.key,
+				chunks: chunkNumber,
 				productsFound: totalFound,
 				productsImported: totalImported,
 			};
@@ -1030,7 +1152,10 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 						error_message = ?
 					WHERE id = ?
 				`)
-				.bind(message, importId)
+				.bind(
+					message,
+					importId,
+				)
 				.run();
 
 			throw error;
