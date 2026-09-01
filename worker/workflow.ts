@@ -1,1006 +1,1039 @@
-import { WorkflowEntrypoint, DurableObject } from "cloudflare:workers";
-
-const MERCHANT_NAME = "Fressnapf-Online-Shop DE";
-const MERCHANT_WEBSITE = "https://www.fressnapf.de";
-const AFFILIATE_NETWORK = "Awin";
-const AFFILIATE_ID = "14757";
-
-const DOG_FOOD_RE =
-  /(hundefutter|hund|dog|canine|puppy|welpe|adult|senior|junior|trockenfutter|nassfutter|hundemahlzeit|barf)/i;
-
-function money(value: unknown): number {
-  if (value === null || value === undefined || value === "") {
-    return 0;
-  }
-
-  const n = Number(
-    String(value)
-      .trim()
-      .replace(/\s/g, "")
-      .replace(",", ".")
-  );
-
-  return Number.isFinite(n) ? Math.round(n * 100) : 0;
-}
-
-function number(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  const n = Number(
-    String(value)
-      .trim()
-      .replace(",", ".")
-  );
-
-  return Number.isFinite(n) ? n : null;
-}
-
-function packageInfo(name: unknown): {
-  size: number | null;
-  unit: string | null;
-} {
-  const match = String(name || "").match(
-    /(\d+(?:[.,]\d+)?)\s*(kg|g|ml|l)\b/i
-  );
-
-  if (!match) {
-    return {
-      size: null,
-      unit: null
-    };
-  }
-
-  let size = Number(
-    match[1].replace(",", ".")
-  );
-
-  let unit = match[2].toLowerCase();
-
-  if (unit === "g") {
-    size /= 1000;
-    unit = "kg";
-  }
-
-  if (unit === "ml") {
-    size /= 1000;
-    unit = "l";
-  }
-
-  return {
-    size,
-    unit
-  };
-}
-
-function isDogFood(
-  row: Record<string, string>
-): boolean {
-  const text = [
-    row.merchant_category,
-    row.category_name,
-    row.merchant_product_category_path,
-    row.merchant_product_second_category,
-    row.merchant_product_third_category,
-    row.product_type,
-    row.product_name,
-    row.keywords
-  ].join(" ");
-
-  return DOG_FOOD_RE.test(text);
-}
-
-function canonicalKey(
-  row: Record<string, string>
-): string {
-  const ean = String(
-    row.ean ||
-      row.product_GTIN ||
-      ""
-  ).trim();
-
-  if (ean) {
-    return `ean:${ean}`;
-  }
-
-  const brand = String(
-    row.brand_name || ""
-  )
-    .trim()
-    .toLowerCase();
-
-  const name = String(
-    row.product_name || ""
-  )
-    .trim()
-    .toLowerCase();
-
-  return `name:${brand}|${name}`;
-}
-
-class CSVParser {
-  private onRow: (
-    row: Record<string, string>
-  ) => Promise<void>;
-
-  private headers: string[] | null = null;
-  private row: string[] = [];
-  private field = "";
-  private inQuotes = false;
-  private pendingQuote = false;
-
-  constructor(
-    onRow: (
-      row: Record<string, string>
-    ) => Promise<void>
-  ) {
-    this.onRow = onRow;
-  }
-
-  async push(
-    text: string,
-    final = false
-  ): Promise<void> {
-    for (
-      let i = 0;
-      i < text.length;
-      i++
-    ) {
-      const c = text[i];
-
-      if (this.pendingQuote) {
-        this.pendingQuote = false;
-
-        if (c === '"') {
-          this.field += '"';
-          continue;
-        }
-
-        this.inQuotes = false;
-      }
-
-      if (this.inQuotes) {
-        if (c === '"') {
-          this.pendingQuote = true;
-        } else {
-          this.field += c;
-        }
-
-        continue;
-      }
-
-      if (c === '"') {
-        this.inQuotes = true;
-      } else if (c === ",") {
-        this.row.push(this.field);
-        this.field = "";
-      } else if (c === "\n") {
-        this.row.push(this.field);
-        this.field = "";
-
-        await this.finishRow();
-      } else if (c !== "\r") {
-        this.field += c;
-      }
-    }
-
-    if (final) {
-      if (this.pendingQuote) {
-        this.pendingQuote = false;
-        this.inQuotes = false;
-      }
-
-      if (
-        this.field.length ||
-        this.row.length
-      ) {
-        this.row.push(this.field);
-        this.field = "";
-
-        await this.finishRow();
-      }
-    }
-  }
-
-  private async finishRow(): Promise<void> {
-    if (!this.headers) {
-      this.headers = this.row.map(
-        (x) => x.trim()
-      );
-
-      this.row = [];
-      return;
-    }
-
-    const values = this.row;
-
-    this.row = [];
-
-    if (!values.length) {
-      return;
-    }
-
-    const result: Record<
-      string,
-      string
-    > = {};
-
-    for (
-      let i = 0;
-      i < this.headers.length;
-      i++
-    ) {
-      result[this.headers[i]] =
-        values[i] ?? "";
-    }
-
-    await this.onRow(result);
-  }
-}
-
-async function getMerchant(
-  env: Env
-): Promise<{ id: number }> {
-  const result =
-    await env.DB.prepare(`
-      INSERT INTO merchants
-        (
-          name,
-          website,
-          affiliate_network,
-          affiliate_id
-        )
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(name)
-      DO UPDATE SET
-        website = excluded.website,
-        affiliate_network =
-          excluded.affiliate_network,
-        affiliate_id =
-          excluded.affiliate_id
-      RETURNING id
-    `)
-      .bind(
-        MERCHANT_NAME,
-        MERCHANT_WEBSITE,
-        AFFILIATE_NETWORK,
-        AFFILIATE_ID
-      )
-      .first<{ id: number }>();
-
-  if (!result?.id) {
-    throw new Error(
-      "Fressnapf-Händler konnte nicht angelegt werden."
-    );
-  }
-
-  return result;
-}
-
-async function createImport(
-  env: Env,
-  merchantId: number
-): Promise<{ id: number }> {
-  const result =
-    await env.DB.prepare(`
-      INSERT INTO imports
-        (
-          merchant_id,
-          source_name,
-          status
-        )
-      VALUES (?, ?, 'running')
-      RETURNING id
-    `)
-      .bind(
-        merchantId,
-        SOURCE_NAME
-      )
-      .first<{ id: number }>();
-
-  if (!result?.id) {
-    throw new Error(
-      "Import-Datensatz konnte nicht erstellt werden."
-    );
-  }
-
-  return result;
-}
-
-const SOURCE_NAME =
-  "Fressnapf Awin Feed";
-
-async function importFeed(
-  env: Env
-): Promise<Record<string, unknown>> {
-  if (!env.FRESSNAPF_FEED_URL) {
-    throw new Error(
-      "FRESSNAPF_FEED_URL fehlt."
-    );
-  }
-
-  const merchant =
-    await getMerchant(env);
-
-  const importRecord =
-    await createImport(
-      env,
-      merchant.id
-    );
-
-  let productsFound = 0;
-  let productsImported = 0;
-  let productsMatched = 0;
-
-  try {
-    const response = await fetch(
-      env.FRESSNAPF_FEED_URL,
-      {
-        headers: {
-          "User-Agent":
-            "WAUVERO/1.0 Feed Import"
-        }
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `Fressnapf Feed HTTP ${response.status}`
-      );
-    }
-
-    if (!response.body) {
-      throw new Error(
-        "Fressnapf Feed liefert keinen Datenstrom."
-      );
-    }
-
-    let body = response.body;
-
-    const contentEncoding =
-      response.headers.get(
-        "content-encoding"
-      );
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      );
-
-    if (
-      contentEncoding?.includes("gzip") ||
-      contentType?.includes("gzip") ||
-      env.FRESSNAPF_FEED_URL
-        .toLowerCase()
-        .includes(".gz")
-    ) {
-      body = body.pipeThrough(
-        new DecompressionStream("gzip")
-      );
-    }
-
-    const reader =
-      body.getReader();
-
-    const decoder =
-      new TextDecoder("utf-8");
-
-    let batch:
-      Record<string, string>[] = [];
-
-    const flush = async () => {
-      if (!batch.length) {
-        return;
-      }
-
-      const rows = batch;
-
-      batch = [];
-
-      for (const row of rows) {
-        const name = String(
-          row.product_name || ""
-        ).trim();
-
-        if (!name) {
-          continue;
-        }
-
-        const ean =
-          String(
-            row.ean ||
-              row.product_GTIN ||
-              ""
-          ).trim() || null;
-
-        const canonical =
-          canonicalKey(row);
-
-        const pkg =
-          packageInfo(name);
-
-        let product:
-          | { id: number }
-          | null = null;
-
-        /*
-         * Bestehende Daten werden zunächst
-         * über EAN gesucht.
-         */
-        if (ean) {
-          product =
-            await env.DB.prepare(`
-              SELECT id
-              FROM products
-              WHERE ean_gtin = ?
-              LIMIT 1
-            `)
-              .bind(ean)
-              .first<{ id: number }>();
-        }
-
-        /*
-         * Danach über canonical_key.
-         */
-        if (!product) {
-          product =
-            await env.DB.prepare(`
-              SELECT id
-              FROM products
-              WHERE canonical_key = ?
-              LIMIT 1
-            `)
-              .bind(canonical)
-              .first<{ id: number }>();
-        }
-
-        /*
-         * Neues Produkt.
-         */
-        if (!product) {
-          product =
-            await env.DB.prepare(`
-              INSERT INTO products
-                (
-                  canonical_key,
-                  ean_gtin,
-                  brand,
-                  name,
-                  animal_type,
-                  category,
-                  food_type,
-                  life_stage
-                )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-              RETURNING id
-            `)
-              .bind(
-                canonical,
-                ean,
-                row.brand_name ||
-                  null,
-                name,
-                "dog",
-                row.merchant_category ||
-                  null,
-                row.product_type ||
-                  null,
-                row.life_stage ||
-                  null
-              )
-              .first<{ id: number }>();
-        }
-
-        /*
-         * Bestehendes Produkt aktualisieren.
-         */
-        if (product?.id) {
-          await env.DB.prepare(`
-            UPDATE products
-            SET
-              ean_gtin =
-                COALESCE(?, ean_gtin),
-              brand =
-                COALESCE(?, brand),
-              name = ?,
-              category =
-                COALESCE(?, category),
-              food_type =
-                COALESCE(?, food_type),
-              life_stage =
-                COALESCE(?, life_stage),
-              updated_at =
-                CURRENT_TIMESTAMP
-            WHERE id = ?
-          `)
-            .bind(
-              ean,
-              row.brand_name ||
-                null,
-              name,
-              row.merchant_category ||
-                null,
-              row.product_type ||
-                null,
-              row.life_stage ||
-                null,
-              product.id
-            )
-            .run();
-        }
-
-        if (!product?.id) {
-          continue;
-        }
-
-        const merchantProductId =
-          String(
-            row.merchant_product_id ||
-              row.aw_product_id ||
-              ""
-          ).trim();
-
-        if (!merchantProductId) {
-          continue;
-        }
-
-        const priceCents =
-          money(
-            row.search_price ||
-              row.display_price
-          );
-
-        if (priceCents <= 0) {
-          continue;
-        }
-
-        const shippingCents =
-          money(
-            row.delivery_cost
-          );
-
-        const totalPriceCents =
-          priceCents +
-          shippingCents;
-
-        const available =
-          (
-            String(row.in_stock)
-              .toLowerCase() === "1" ||
-            String(row.in_stock)
-              .toLowerCase() === "true"
-          ) &&
-          String(row.is_for_sale)
-            .toLowerCase() !== "0"
-            ? 1
-            : 0;
-
-        /*
-         * Händlerprodukt.
-         */
-        const existing =
-          await env.DB.prepare(`
-            SELECT id
-            FROM merchant_products
-            WHERE merchant_id = ?
-              AND merchant_product_id = ?
-            LIMIT 1
-          `)
-            .bind(
-              merchant.id,
-              merchantProductId
-            )
-            .first<{ id: number }>();
-
-        let merchantProduct:
-          | { id: number }
-          | null = null;
-
-        if (existing) {
-          merchantProduct = existing;
-
-          await env.DB.prepare(`
-            UPDATE merchant_products
-            SET
-              product_id = ?,
-              ean_gtin = COALESCE(?, ean_gtin),
-              product_name = ?,
-              product_url = ?,
-              affiliate_url = ?,
-              image_url = ?,
-              currency = ?,
-              updated_at =
-                CURRENT_TIMESTAMP
-            WHERE id = ?
-          `)
-            .bind(
-              product.id,
-              ean,
-              name,
-              row.merchant_deep_link ||
-                null,
-              row.aw_deep_link ||
-                null,
-              row.merchant_image_url ||
-                row.large_image ||
-                null,
-              row.currency || "EUR",
-              existing.id
-            )
-            .run();
-        } else {
-          merchantProduct =
-            await env.DB.prepare(`
-              INSERT INTO merchant_products
-                (
-                  merchant_id,
-                  product_id,
-                  merchant_product_id,
-                  ean_gtin,
-                  product_name,
-                  product_url,
-                  affiliate_url,
-                  image_url,
-                  currency
-                )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-              RETURNING id
-            `)
-              .bind(
-                merchant.id,
-                product.id,
-                merchantProductId,
-                ean,
-                name,
-                row.merchant_deep_link ||
-                  null,
-                row.aw_deep_link ||
-                  null,
-                row.merchant_image_url ||
-                  row.large_image ||
-                  null,
-                row.currency || "EUR"
-              )
-              .first<{ id: number }>();
-        }
-
-        if (!merchantProduct?.id) {
-          continue;
-        }
-
-        /*
-         * Aktuelles Angebot.
-         */
-        await env.DB.prepare(`
-          INSERT INTO offers
-            (
-              merchant_product_id,
-              price_cents,
-              shipping_cents,
-              total_price_cents,
-              available
-            )
-          VALUES (?, ?, ?, ?, ?)
-          ON CONFLICT(merchant_product_id)
-          DO UPDATE SET
-            price_cents =
-              excluded.price_cents,
-            shipping_cents =
-              excluded.shipping_cents,
-            total_price_cents =
-              excluded.total_price_cents,
-            available =
-              excluded.available,
-            checked_at =
-              CURRENT_TIMESTAMP
-        `)
-          .bind(
-            merchantProduct.id,
-            priceCents,
-            shippingCents,
-            totalPriceCents,
-            available
-          )
-          .run();
-
-        /*
-         * Preishistorie:
-         * nur ein neuer Eintrag, wenn sich
-         * der aktuelle Gesamtpreis geändert hat.
-         */
-        const previous =
-          await env.DB.prepare(`
-            SELECT total_price_cents
-            FROM price_history
-            WHERE merchant_product_id = ?
-            ORDER BY recorded_at DESC, id DESC
-            LIMIT 1
-          `)
-            .bind(
-              merchantProduct.id
-            )
-            .first<{
-              total_price_cents: number;
-            }>();
-
-        if (
-          !previous ||
-          previous.total_price_cents !==
-            totalPriceCents
-        ) {
-          await env.DB.prepare(`
-            INSERT INTO price_history
-              (
-                merchant_product_id,
-                price_cents,
-                shipping_cents,
-                total_price_cents,
-                available
-              )
-            VALUES (?, ?, ?, ?, ?)
-          `)
-            .bind(
-              merchantProduct.id,
-              priceCents,
-              shippingCents,
-              totalPriceCents,
-              available
-            )
-            .run();
-        }
-
-        productsImported++;
-      }
-    };
-
-    const parser =
-      new CSVParser(async (row) => {
-        if (isDogFood(row)) {
-          productsFound++;
-          batch.push(row);
-
-          if (batch.length >= 50) {
-            await flush();
-          }
-        }
-      });
-
-    while (true) {
-      const {
-        value,
-        done
-      } = await reader.read();
-
-      if (done) {
-        break;
-      }
-
-      const text =
-        decoder.decode(
-          value,
-          {
-            stream: true
-          }
-        );
-
-      await parser.push(text);
-    }
-
-    await parser.push(
-      decoder.decode(),
-      true
-    );
-
-    await flush();
-
-    await env.DB.prepare(`
-      UPDATE imports
-      SET
-        status = 'completed',
-        products_found = ?,
-        products_imported = ?,
-        products_matched = ?,
-        finished_at =
-          CURRENT_TIMESTAMP,
-        error_message = NULL
-      WHERE id = ?
-    `)
-      .bind(
-        productsFound,
-        productsImported,
-        productsMatched,
-        importRecord.id
-      )
-      .run();
-
-    return {
-      success: true,
-      import_id: importRecord.id,
-      merchant: MERCHANT_NAME,
-      products_found: productsFound,
-      products_imported:
-        productsImported,
-      products_matched:
-        productsMatched
-    };
-  } catch (error) {
-    await env.DB.prepare(`
-      UPDATE imports
-      SET
-        status = 'failed',
-        finished_at =
-          CURRENT_TIMESTAMP,
-        error_message = ?
-      WHERE id = ?
-    `)
-      .bind(
-        String(
-          error instanceof Error
-            ? error.message
-            : error
-        ),
-        importRecord.id
-      )
-      .run();
-
-    throw error;
-  }
-}
-
-export class MyWorkflow
-  extends WorkflowEntrypoint<Env> {
-  async run(
-    event: unknown,
-    step: {
-      do<T>(
-        name: string,
-        callback: () => Promise<T>
-      ): Promise<T>;
-    }
-  ) {
-    return await step.do(
-      "Fressnapf Feed Import",
-      async () => {
-        return await importFeed(
-          this.env
-        );
-      }
-    );
-  }
-}
-
-export class WorkflowStatusDO
-  extends DurableObject {
-  async fetch(): Promise<Response> {
-    return new Response("OK");
-  }
-}
-
-const worker = {
-  async fetch(
-    request: Request,
-    env: Env
-  ): Promise<Response> {
-    const url =
-      new URL(request.url);
-
-    if (
-      url.pathname ===
-        "/api/import/fressnapf" &&
-      request.method === "POST"
-    ) {
-      try {
-        const instance =
-          await env.MY_WORKFLOW.create({
-            params: {
-              merchant: "fressnapf",
-              startedAt:
-                new Date().toISOString()
-            }
-          });
-
-        return Response.json({
-          success: true,
-          started: true,
-          instance_id: instance.id,
-          status_url:
-            `/api/import/status/${instance.id}`
-        });
-      } catch (error) {
-        return Response.json(
-          {
-            success: false,
-            error:
-              error instanceof Error
-                ? error.message
-                : String(error)
-          },
-          {
-            status: 500
-          }
-        );
-      }
-    }
-
-    if (
-      url.pathname.startsWith(
-        "/api/import/status/"
-      )
-    ) {
-      const instanceId =
-        url.pathname
-          .split("/")
-          .pop();
-
-      if (!instanceId) {
-        return Response.json(
-          {
-            success: false,
-            error:
-              "Instance ID fehlt."
-          },
-          {
-            status: 400
-          }
-        );
-      }
-
-      try {
-        const instance =
-          await env.MY_WORKFLOW.get(
-            instanceId
-          );
-
-        const status =
-          await instance.status();
-
-        return Response.json({
-          success: true,
-          instance_id: instanceId,
-          status
-        });
-      } catch (error) {
-        return Response.json(
-          {
-            success: false,
-            error:
-              error instanceof Error
-                ? error.message
-                : String(error)
-          },
-          {
-            status: 500
-          }
-        );
-      }
-    }
-
-    if (
-      url.pathname ===
-      "/api/health"
-    ) {
-      return Response.json({
-        success: true,
-        worker:
-          "wauvero-feed-import",
-        database:
-          "wauvero-db",
-        version:
-          "fressnapf-workflow-v3"
-      });
-    }
-
-    return Response.json(
-      {
-        success: false,
-        error: "Not Found"
-      },
-      {
-        status: 404
-      }
-    );
-  }
+import { WorkflowEntrypoint } from "cloudflare:workers";
+
+const SOURCE_NAME = "Fressnapf Awin Feed";
+const FEED_PREFIX = "feeds/fressnapf/";
+const CHUNK_SIZE = 256 * 1024;
+
+type FeedSource = {
+	key: string;
+	size: number;
+	etag: string;
 };
 
-export default worker;
+type FeedRow = Record<string, string>;
+
+type DbRow = {
+	key: string;
+	ean: string | null;
+	brand: string | null;
+	name: string;
+	category: string | null;
+	mpid: string;
+	url: string | null;
+	affiliate: string | null;
+	image: string | null;
+	currency: string;
+	price: number;
+	shipping: number;
+	total: number;
+	available: number;
+	updated: string | null;
+};
+
+function normalize(value: string | undefined): string {
+	return (value ?? "").trim();
+}
+
+function moneyToCents(value: string | undefined): number {
+	const raw = normalize(value).replace(/[^\d,.-]/g, "");
+
+	if (!raw) return 0;
+
+	const comma = raw.lastIndexOf(",");
+	const dot = raw.lastIndexOf(".");
+
+	let normalized = raw;
+
+	if (comma >= 0 && dot >= 0) {
+		normalized =
+			comma > dot
+				? raw.replace(/\./g, "").replace(",", ".")
+				: raw.replace(/,/g, "");
+	} else if (comma >= 0) {
+		normalized = raw.replace(/\./g, "").replace(",", ".");
+	}
+
+	const n = Number.parseFloat(normalized);
+
+	return Number.isFinite(n)
+		? Math.max(0, Math.round(n * 100))
+		: 0;
+}
+
+function isAvailable(value: string | undefined): number {
+	const v = normalize(value).toLowerCase();
+
+	return [
+		"0",
+		"false",
+		"no",
+		"nein",
+		"out of stock",
+		"outofstock",
+		"unavailable",
+	].includes(v)
+		? 0
+		: 1;
+}
+
+function parseCsvRecord(record: string): string[] {
+	const result: string[] = [];
+	let current = "";
+	let quoted = false;
+
+	for (let i = 0; i < record.length; i++) {
+		const c = record[i];
+
+		if (c === '"') {
+			if (quoted && record[i + 1] === '"') {
+				current += '"';
+				i++;
+			} else {
+				quoted = !quoted;
+			}
+			continue;
+		}
+
+		if (c === "," && !quoted) {
+			result.push(current);
+			current = "";
+			continue;
+		}
+
+		current += c;
+	}
+
+	result.push(current);
+	return result;
+}
+
+function splitRecords(text: string): {
+	records: string[];
+	remainder: string;
+} {
+	const records: string[] = [];
+
+	let start = 0;
+	let quoted = false;
+
+	for (let i = 0; i < text.length; i++) {
+		const c = text[i];
+
+		if (c === '"') {
+			if (quoted && text[i + 1] === '"') {
+				i++;
+			} else {
+				quoted = !quoted;
+			}
+			continue;
+		}
+
+		if ((c === "\n" || c === "\r") && !quoted) {
+			records.push(text.slice(start, i));
+
+			if (c === "\r" && text[i + 1] === "\n") {
+				i++;
+			}
+
+			start = i + 1;
+		}
+	}
+
+	return {
+		records,
+		remainder: text.slice(start),
+	};
+}
+
+function rowFromRecord(
+	record: string,
+	headers: string[],
+): FeedRow {
+	const values = parseCsvRecord(record);
+	const row: FeedRow = {};
+
+	for (let i = 0; i < headers.length; i++) {
+		row[headers[i]] = values[i] ?? "";
+	}
+
+	return row;
+}
+
+function getMpid(row: FeedRow): string {
+	return (
+		normalize(row.merchant_product_id) ||
+		normalize(row.aw_product_id)
+	);
+}
+
+function getEan(row: FeedRow): string | null {
+	const value =
+		normalize(row.product_GTIN) ||
+		normalize(row.ean);
+
+	return value || null;
+}
+
+function getName(row: FeedRow): string {
+	return (
+		normalize(row.product_short_description) ||
+		normalize(row.product_name) ||
+		normalize(row.description) ||
+		"Unbekanntes Produkt"
+	);
+}
+
+function getBrand(row: FeedRow): string | null {
+	const value = normalize(row.brand_name);
+	return value || null;
+}
+
+function getCategory(row: FeedRow): string | null {
+	const value = normalize(row.merchant_category);
+	return value || null;
+}
+
+function getProductUrl(row: FeedRow): string | null {
+	const value =
+		normalize(row.merchant_deep_link) ||
+		normalize(row.aw_deep_link);
+
+	return value || null;
+}
+
+function getAffiliateUrl(row: FeedRow): string | null {
+	const value = normalize(row.aw_deep_link);
+	return value || null;
+}
+
+function getImageUrl(row: FeedRow): string | null {
+	const value =
+		normalize(row.merchant_image_url) ||
+		normalize(row.aw_image_url);
+
+	return value || null;
+}
+
+function getCurrency(row: FeedRow): string {
+	return normalize(row.currency) || "EUR";
+}
+
+function getUpdated(row: FeedRow): string | null {
+	const value = normalize(row.last_updated);
+	return value || null;
+}
+
+function canonicalKey(row: FeedRow): string {
+	const ean = getEan(row);
+	const mpid = getMpid(row);
+
+	return ean
+		? `ean:${ean}`
+		: `merchant-product:${mpid}`;
+}
+
+function isDogProduct(row: FeedRow): boolean {
+	const category = [
+		row.merchant_category,
+		row.merchant_product_category_path,
+		row.category_name,
+	].join(" ");
+
+	const text = [
+		row.product_short_description,
+		row.product_name,
+		row.description,
+		row.product_type,
+		row.keywords,
+	].join(" ");
+
+	if (
+		/\b(katze|katzen|cat|feline|katzenfutter)\b/i.test(
+			category,
+		)
+	) {
+		return false;
+	}
+
+	if (
+		/\b(hund|hunde|dog|canine)\b/i.test(category) ||
+		/\b(hundefutter|hundesnack|hundesnacks|kauartikel|kausnack|kausnacks|leckerli|trockenfutter|nassfutter|barf)\b/i.test(
+			text,
+		)
+	) {
+		return true;
+	}
+
+	return false;
+}
+
+async function findFeed(
+	env: Env,
+): Promise<FeedSource> {
+	const objects: R2Object[] = [];
+
+	let cursor: string | undefined;
+
+	do {
+		const page = await env.FEED_BUCKET.list({
+			prefix: FEED_PREFIX,
+			limit: 1000,
+			...(cursor ? { cursor } : {}),
+		});
+
+		objects.push(
+			...page.objects.filter((o) =>
+				o.key.toLowerCase().endsWith(".csv"),
+			),
+		);
+
+		cursor = page.truncated
+			? page.cursor
+			: undefined;
+	} while (cursor);
+
+	objects.sort(
+		(a, b) =>
+			b.uploaded.getTime() -
+			a.uploaded.getTime(),
+	);
+
+	const feed = objects[0];
+
+	if (!feed) {
+		throw new Error(
+			"Kein Fressnapf-CSV-Feed gefunden.",
+		);
+	}
+
+	return {
+		key: feed.key,
+		size: feed.size,
+		etag: feed.etag,
+	};
+}
+
+async function readHeader(
+	env: Env,
+	source: FeedSource,
+): Promise<{
+	headers: string[];
+	offset: number;
+}> {
+	const object = await env.FEED_BUCKET.get(
+		source.key,
+		{
+			range: {
+				offset: 0,
+				length: CHUNK_SIZE,
+			},
+		},
+	);
+
+	if (!object) {
+		throw new Error(
+			"CSV-Header konnte nicht gelesen werden.",
+		);
+	}
+
+	const bytes = new Uint8Array(
+		await object.arrayBuffer(),
+	);
+
+	let quoted = false;
+	let newline = -1;
+
+	for (let i = 0; i < bytes.length; i++) {
+		if (bytes[i] === 34) {
+			if (quoted && bytes[i + 1] === 34) {
+				i++;
+			} else {
+				quoted = !quoted;
+			}
+		} else if (
+			bytes[i] === 10 &&
+			!quoted
+		) {
+			newline = i;
+			break;
+		}
+	}
+
+	if (newline < 0) {
+		throw new Error(
+			"CSV-Header nicht gefunden.",
+		);
+	}
+
+	let headerBytes = bytes.slice(0, newline);
+
+	if (
+		headerBytes.length > 0 &&
+		headerBytes[headerBytes.length - 1] === 13
+	) {
+		headerBytes = headerBytes.slice(0, -1);
+	}
+
+	const header = new TextDecoder("utf-8", {
+		fatal: true,
+		ignoreBOM: false,
+	}).decode(headerBytes);
+
+	return {
+		headers: parseCsvRecord(
+			header.replace(/^\uFEFF/, ""),
+		).map((v) => v.trim()),
+		offset: newline + 1,
+	};
+}
+
+function prepareRows(
+	rows: FeedRow[],
+): DbRow[] {
+	const map = new Map<string, DbRow>();
+
+	for (const row of rows) {
+		const mpid = getMpid(row);
+
+		if (!mpid) continue;
+
+		const price = moneyToCents(
+			row.search_price ||
+				row.display_price,
+		);
+
+		if (price <= 0) continue;
+
+		const shipping = moneyToCents(
+			row.delivery_cost,
+		);
+
+		map.set(mpid, {
+			key: canonicalKey(row),
+			ean: getEan(row),
+			brand: getBrand(row),
+			name: getName(row),
+			category: getCategory(row),
+			mpid,
+			url: getProductUrl(row),
+			affiliate: getAffiliateUrl(row),
+			image: getImageUrl(row),
+			currency: getCurrency(row),
+			price,
+			shipping,
+			total: price + shipping,
+			available: isAvailable(row.in_stock),
+			updated: getUpdated(row),
+		});
+	}
+
+	return Array.from(map.values());
+}
+
+async function processChunk(
+	env: Env,
+	source: FeedSource,
+	merchantId: number,
+	headers: string[],
+	offset: number,
+	remainder: string,
+): Promise<{
+	nextOffset: number;
+	remainder: string;
+	found: number;
+	imported: number;
+	done: boolean;
+}> {
+	const object = await env.FEED_BUCKET.get(
+		source.key,
+		{
+			range: {
+				offset,
+				length: Math.min(
+					CHUNK_SIZE,
+					source.size - offset,
+				),
+			},
+		},
+	);
+
+	if (!object) {
+		throw new Error(
+			`Feed konnte bei Offset ${offset} nicht gelesen werden.`,
+		);
+	}
+
+	const bytes = new Uint8Array(
+		await object.arrayBuffer(),
+	);
+
+	if (!bytes.length) {
+		throw new Error(
+			`Leerer Feed-Chunk bei Offset ${offset}.`,
+		);
+	}
+
+	let text = "";
+
+	let decoded = false;
+
+	for (let trim = 0; trim <= 3; trim++) {
+		try {
+			text = new TextDecoder("utf-8", {
+				fatal: true,
+				ignoreBOM: false,
+			}).decode(
+				bytes.slice(
+					0,
+					bytes.length - trim,
+				),
+			);
+
+			decoded = true;
+			break;
+		} catch {
+			// trailing UTF-8 bytes
+		}
+	}
+
+	if (!decoded) {
+		throw new Error(
+			`UTF-8-Dekodierung bei Offset ${offset} fehlgeschlagen.`,
+		);
+	}
+
+	const split = splitRecords(
+		remainder + text,
+	);
+
+	const feedRows: FeedRow[] = [];
+
+	for (const record of split.records) {
+		if (!record.trim()) continue;
+
+		const row = rowFromRecord(
+			record,
+			headers,
+		);
+
+		if (isDogProduct(row)) {
+			feedRows.push(row);
+		}
+	}
+
+	const rows = prepareRows(feedRows);
+
+	if (rows.length > 0) {
+		const json = JSON.stringify(rows);
+
+		await env.DB.batch([
+			env.DB.prepare(`
+				INSERT INTO products (
+					canonical_key,
+					ean_gtin,
+					brand,
+					name,
+					animal_type,
+					category
+				)
+				SELECT
+					json_extract(value, '$.key'),
+					NULLIF(
+						json_extract(value, '$.ean'),
+						''
+					),
+					NULLIF(
+						json_extract(value, '$.brand'),
+						''
+					),
+					json_extract(value, '$.name'),
+					'dog',
+					NULLIF(
+						json_extract(value, '$.category'),
+						''
+					)
+				FROM json_each(?)
+				ON CONFLICT(canonical_key)
+				DO UPDATE SET
+					ean_gtin =
+						COALESCE(
+							excluded.ean_gtin,
+							products.ean_gtin
+						),
+					brand =
+						COALESCE(
+							excluded.brand,
+							products.brand
+						),
+					name =
+						excluded.name,
+					animal_type =
+						'dog',
+					category =
+						COALESCE(
+							excluded.category,
+							products.category
+						),
+					updated_at =
+						CURRENT_TIMESTAMP
+			`).bind(json),
+
+			env.DB.prepare(`
+				INSERT INTO merchant_products (
+					merchant_id,
+					product_id,
+					merchant_product_id,
+					ean_gtin,
+					product_name,
+					product_url,
+					affiliate_url,
+					image_url,
+					currency
+				)
+				SELECT
+					?,
+					p.id,
+					json_extract(j.value, '$.mpid'),
+					NULLIF(
+						json_extract(j.value, '$.ean'),
+						''
+					),
+					json_extract(j.value, '$.name'),
+					NULLIF(
+						json_extract(j.value, '$.url'),
+						''
+					),
+					NULLIF(
+						json_extract(j.value, '$.affiliate'),
+						''
+					),
+					NULLIF(
+						json_extract(j.value, '$.image'),
+						''
+					),
+					COALESCE(
+						NULLIF(
+							json_extract(
+								j.value,
+								'$.currency'
+							),
+							''
+						),
+						'EUR'
+					)
+				FROM json_each(?) j
+				JOIN products p
+					ON p.canonical_key =
+						json_extract(
+							j.value,
+							'$.key'
+						)
+				ON CONFLICT (
+					merchant_id,
+					merchant_product_id
+				)
+				DO UPDATE SET
+					product_id =
+						excluded.product_id,
+					ean_gtin =
+						excluded.ean_gtin,
+					product_name =
+						excluded.product_name,
+					product_url =
+						excluded.product_url,
+					affiliate_url =
+						excluded.affiliate_url,
+					image_url =
+						excluded.image_url,
+					currency =
+						excluded.currency,
+					updated_at =
+						CURRENT_TIMESTAMP
+			`).bind(
+				merchantId,
+				json,
+			),
+
+			env.DB.prepare(`
+				INSERT INTO offers (
+					merchant_product_id,
+					price_cents,
+					shipping_cents,
+					total_price_cents,
+					available,
+					source_updated_at
+				)
+				SELECT
+					mp.id,
+					CAST(
+						json_extract(
+							j.value,
+							'$.price'
+						) AS INTEGER
+					),
+					CAST(
+						json_extract(
+							j.value,
+							'$.shipping'
+						) AS INTEGER
+					),
+					CAST(
+						json_extract(
+							j.value,
+							'$.total'
+						) AS INTEGER
+					),
+					CAST(
+						json_extract(
+							j.value,
+							'$.available'
+						) AS INTEGER
+					),
+					NULLIF(
+						json_extract(
+							j.value,
+							'$.updated'
+						),
+						''
+					)
+				FROM json_each(?) j
+				JOIN merchant_products mp
+					ON
+						mp.merchant_id = ?
+						AND mp.merchant_product_id =
+							json_extract(
+								j.value,
+								'$.mpid'
+							)
+				ON CONFLICT (
+					merchant_product_id
+				)
+				DO UPDATE SET
+					price_cents =
+						excluded.price_cents,
+					shipping_cents =
+						excluded.shipping_cents,
+					total_price_cents =
+						excluded.total_price_cents,
+					available =
+						excluded.available,
+					source_updated_at =
+						excluded.source_updated_at,
+					checked_at =
+						CURRENT_TIMESTAMP
+			`).bind(
+				json,
+				merchantId,
+			),
+
+			env.DB.prepare(`
+				INSERT INTO price_history (
+					merchant_product_id,
+					price_cents,
+					shipping_cents,
+					total_price_cents,
+					available,
+					recorded_at
+				)
+				SELECT
+					mp.id,
+					CAST(
+						json_extract(
+							j.value,
+							'$.price'
+						) AS INTEGER
+					),
+					CAST(
+						json_extract(
+							j.value,
+							'$.shipping'
+						) AS INTEGER
+					),
+					CAST(
+						json_extract(
+							j.value,
+							'$.total'
+						) AS INTEGER
+					),
+					CAST(
+						json_extract(
+							j.value,
+							'$.available'
+						) AS INTEGER
+					),
+					CURRENT_TIMESTAMP
+				FROM json_each(?) j
+				JOIN merchant_products mp
+					ON
+						mp.merchant_id = ?
+						AND mp.merchant_product_id =
+							json_extract(
+								j.value,
+								'$.mpid'
+							)
+				WHERE NOT EXISTS (
+					SELECT 1
+					FROM price_history h
+					WHERE
+						h.merchant_product_id =
+							mp.id
+						AND h.price_cents =
+							CAST(
+								json_extract(
+									j.value,
+									'$.price'
+								) AS INTEGER
+							)
+						AND h.shipping_cents =
+							CAST(
+								json_extract(
+									j.value,
+									'$.shipping'
+								) AS INTEGER
+							)
+						AND h.total_price_cents =
+							CAST(
+								json_extract(
+									j.value,
+									'$.total'
+								) AS INTEGER
+							)
+						AND h.available =
+							CAST(
+								json_extract(
+									j.value,
+									'$.available'
+								) AS INTEGER
+							)
+						AND h.recorded_at >=
+							datetime(
+								'now',
+								'-1 hour'
+							)
+				)
+			`).bind(
+				json,
+				merchantId,
+			),
+		]);
+	}
+
+	const nextOffset = Math.min(
+		source.size,
+		offset + bytes.length,
+	);
+
+	return {
+		nextOffset,
+		remainder: split.remainder,
+		found: feedRows.length,
+		imported: rows.length,
+		done:
+			nextOffset >= source.size &&
+			split.remainder.length === 0,
+	};
+}
+
+export class MyWorkflow extends WorkflowEntrypoint<Env> {
+	async run(
+		event: any,
+		step: any,
+	) {
+		const source = await step.do(
+			"find Fressnapf feed",
+			() => findFeed(this.env),
+		);
+
+		const merchant = await step.do(
+			"find Fressnapf merchant",
+			async () => {
+				const result =
+					await this.env.DB
+						.prepare(`
+							SELECT id, name
+							FROM merchants
+							WHERE name LIKE ?
+							LIMIT 1
+						`)
+						.bind("%Fressnapf%")
+						.first<{
+							id: number;
+							name: string;
+						}>();
+
+				if (!result) {
+					throw new Error(
+						"Fressnapf wurde nicht gefunden.",
+					);
+				}
+
+				return result;
+			},
+		);
+
+		const importId = await step.do(
+			"create import",
+			async () => {
+				const result =
+					await this.env.DB
+						.prepare(`
+							INSERT INTO imports (
+								merchant_id,
+								source_name,
+								status
+							)
+							VALUES (?, ?, 'running')
+							RETURNING id
+						`)
+						.bind(
+							merchant.id,
+							SOURCE_NAME,
+						)
+						.first<{
+							id: number;
+						}>();
+
+				if (!result?.id) {
+					throw new Error(
+						"Import konnte nicht erstellt werden.",
+					);
+				}
+
+				return result.id;
+			},
+		);
+
+		try {
+			const header = await step.do(
+				"read CSV header",
+				() =>
+					readHeader(
+						this.env,
+						source,
+					),
+			);
+
+			let offset = header.offset;
+			let remainder = "";
+			let totalFound = 0;
+			let totalImported = 0;
+			let chunk = 0;
+
+			while (
+				offset < source.size ||
+				remainder.length > 0
+			) {
+				const result = await step.do(
+					`import chunk ${chunk + 1}`,
+					() =>
+						processChunk(
+							this.env,
+							source,
+							merchant.id,
+							header.headers,
+							offset,
+							remainder,
+						),
+				);
+
+				if (
+					result.nextOffset <= offset &&
+					!result.done
+				) {
+					throw new Error(
+						`Import-Fortschritt steht bei Offset ${offset}.`,
+					);
+				}
+
+				offset = result.nextOffset;
+				remainder = result.remainder;
+
+				totalFound += result.found;
+				totalImported += result.imported;
+
+				chunk++;
+
+				await step.do(
+					`update import progress ${chunk}`,
+					async () => {
+						await this.env.DB
+							.prepare(`
+								UPDATE imports
+								SET
+									products_found = ?,
+									products_imported = ?,
+									products_matched = ?
+								WHERE id = ?
+									AND status = 'running'
+							`)
+							.bind(
+								totalFound,
+								totalImported,
+								totalImported,
+								importId,
+							)
+							.run();
+					},
+				);
+
+				if (result.done) {
+					break;
+				}
+			}
+
+			await step.do(
+				"complete import",
+				async () => {
+					await this.env.DB
+						.prepare(`
+							UPDATE imports
+							SET
+								status = 'completed',
+								products_found = ?,
+								products_imported = ?,
+								products_matched = ?,
+								finished_at =
+									CURRENT_TIMESTAMP,
+								error_message = NULL
+							WHERE id = ?
+						`)
+						.bind(
+							totalFound,
+							totalImported,
+							totalImported,
+							importId,
+						)
+						.run();
+				},
+			);
+
+			return {
+				success: true,
+				importId,
+				chunks: chunk,
+				productsFound: totalFound,
+				productsImported: totalImported,
+			};
+		} catch (error) {
+			const message =
+				error instanceof Error
+					? error.message
+					: String(error);
+
+			await this.env.DB
+				.prepare(`
+					UPDATE imports
+					SET
+						status = 'failed',
+						finished_at =
+							CURRENT_TIMESTAMP,
+						error_message = ?
+					WHERE id = ?
+				`)
+				.bind(message, importId)
+				.run();
+
+			throw error;
+		}
+	}
+}
