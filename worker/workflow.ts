@@ -1,3 +1,4 @@
+// WAUVERO production deployment trigger
 import { WorkflowEntrypoint } from "cloudflare:workers";
 
 const SOURCE_NAME = "Fressnapf Awin Feed";
