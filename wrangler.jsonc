@@ -8,17 +8,38 @@
 	"main": "worker/index.ts",
 	"compatibility_date": "2025-10-08",
 
-"assets": {
+	"assets": {
 		"directory": "./dist",
 		"not_found_handling": "single-page-application"
 	},
+
 	"observability": {
 		"enabled": true
 	},
+
+	/**
+	 * D1 Database
+	 */
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "wauvero-db",
+			"database_id": "5194009c-b494-4e10-84f3-dae14493bfea"
+		}
+	],
+
+	/**
+	 * R2 Object Storage
+	 */
+	"r2_buckets": [
+		{
+			"binding": "FEED_BUCKET",
+			"bucket_name": "wauvero-feed-files"
+		}
+	],
+
 	/**
 	 * Workflows
-	 * Define Workflows to orchestrate multi-step processes
-	 * https://developers.cloudflare.com/workflows/
 	 */
 	"workflows": [
 		{
@@ -27,10 +48,9 @@
 			"class_name": "MyWorkflow"
 		}
 	],
+
 	/**
 	 * Durable Objects
-	 * Used for WebSocket state management and real-time updates
-	 * https://developers.cloudflare.com/durable-objects/
 	 */
 	"durable_objects": {
 		"bindings": [
@@ -40,9 +60,9 @@
 			}
 		]
 	},
+
 	/**
 	 * Migrations
-	 * Required for Durable Objects
 	 */
 	"migrations": [
 		{
@@ -50,5 +70,6 @@
 			"new_sqlite_classes": ["WorkflowStatusDO"]
 		}
 	],
+
 	"upload_source_maps": true
 }
