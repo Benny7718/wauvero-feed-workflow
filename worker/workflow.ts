@@ -1,8 +1,23 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
+import type {
+	WorkflowEvent,
+	WorkflowStep,
+} from "cloudflare:workers";
+
+interface Env {
+	DB: D1Database;
+	FEED_BUCKET: R2Bucket;
+}
 
 const SOURCE_NAME = "Fressnapf Awin Feed";
 const FEED_PREFIX = "feeds/fressnapf/";
+
 const CHUNK_SIZE = 256 * 1024;
+const DB_BATCH_SIZE = 50;
+const PROGRESS_EVERY_CHUNKS = 8;
+const MAX_REMAINDER_BYTES = 800 * 1024;
+
+type FeedRow = Record<string, string>;
 
 type FeedSource = {
 	key: string;
@@ -10,128 +25,146 @@ type FeedSource = {
 	etag: string;
 };
 
-type FeedRow = Record<string, string>;
+type Header = {
+	headers: string[];
+	offset: number;
+};
 
-type DbRow = {
-	key: string;
-	ean: string | null;
-	brand: string | null;
-	name: string;
-	category: string | null;
-	mpid: string;
-	url: string | null;
-	affiliate: string | null;
-	image: string | null;
-	currency: string;
-	price: number;
-	shipping: number;
-	total: number;
-	available: number;
-	updated: string | null;
+type ChunkResult = {
+	nextOffset: number;
+	found: number;
+	imported: number;
+	matched: number;
+	done: boolean;
 };
 
 function normalize(value: string | undefined): string {
 	return (value ?? "").trim();
 }
 
-function moneyToCents(value: string | undefined): number {
-	const raw = normalize(value).replace(/[^\d,.-]/g, "");
+function numberValue(value: string | undefined): number {
+	const raw = normalize(value);
 
-	if (!raw) return 0;
-
-	const comma = raw.lastIndexOf(",");
-	const dot = raw.lastIndexOf(".");
-
-	let normalized = raw;
-
-	if (comma >= 0 && dot >= 0) {
-		normalized =
-			comma > dot
-				? raw.replace(/\./g, "").replace(",", ".")
-				: raw.replace(/,/g, "");
-	} else if (comma >= 0) {
-		normalized = raw.replace(/\./g, "").replace(",", ".");
+	if (!raw) {
+		return 0;
 	}
 
-	const n = Number.parseFloat(normalized);
+	const cleaned = raw
+		.replace(/[^\d,.-]/g, "")
+		.replace(/\.(?=\d{3}(?:\D|$))/g, "")
+		.replace(",", ".");
 
-	return Number.isFinite(n)
-		? Math.max(0, Math.round(n * 100))
-		: 0;
+	const result = Number.parseFloat(cleaned);
+
+	return Number.isFinite(result) ? result : 0;
 }
 
-function isAvailable(value: string | undefined): number {
-	const v = normalize(value).toLowerCase();
-
-	return [
-		"0",
-		"false",
-		"no",
-		"nein",
-		"out of stock",
-		"outofstock",
-		"unavailable",
-	].includes(v)
-		? 0
-		: 1;
+function cents(value: string | undefined): number {
+	return Math.max(
+		0,
+		Math.round(numberValue(value) * 100),
+	);
 }
 
-function parseCsvRecord(record: string): string[] {
+function available(value: string | undefined): number {
+	const normalized = normalize(value).toLowerCase();
+
+	if (
+		[
+			"0",
+			"false",
+			"no",
+			"nein",
+			"out of stock",
+			"outofstock",
+			"unavailable",
+		].includes(normalized)
+	) {
+		return 0;
+	}
+
+	return 1;
+}
+
+function parseCsvLine(line: string): string[] {
 	const result: string[] = [];
+
 	let current = "";
 	let quoted = false;
 
-	for (let i = 0; i < record.length; i++) {
-		const c = record[i];
+	for (let i = 0; i < line.length; i++) {
+		const char = line[i];
 
-		if (c === '"') {
-			if (quoted && record[i + 1] === '"') {
+		if (char === '"') {
+			if (
+				quoted &&
+				line[i + 1] === '"'
+			) {
 				current += '"';
 				i++;
 			} else {
 				quoted = !quoted;
 			}
+
 			continue;
 		}
 
-		if (c === "," && !quoted) {
+		if (
+			char === "," &&
+			!quoted
+		) {
 			result.push(current);
 			current = "";
 			continue;
 		}
 
-		current += c;
+		current += char;
 	}
 
 	result.push(current);
+
 	return result;
 }
 
-function splitRecords(text: string): {
-	records: string[];
+function splitCompleteLines(
+	text: string,
+): {
+	lines: string[];
 	remainder: string;
 } {
-	const records: string[] = [];
+	const lines: string[] = [];
 
 	let start = 0;
 	let quoted = false;
 
 	for (let i = 0; i < text.length; i++) {
-		const c = text[i];
+		const char = text[i];
 
-		if (c === '"') {
-			if (quoted && text[i + 1] === '"') {
+		if (char === '"') {
+			if (
+				quoted &&
+				text[i + 1] === '"'
+			) {
 				i++;
 			} else {
 				quoted = !quoted;
 			}
+
 			continue;
 		}
 
-		if ((c === "\n" || c === "\r") && !quoted) {
-			records.push(text.slice(start, i));
+		if (
+			(char === "\n" || char === "\r") &&
+			!quoted
+		) {
+			lines.push(
+				text.slice(start, i),
+			);
 
-			if (c === "\r" && text[i + 1] === "\n") {
+			if (
+				char === "\r" &&
+				text[i + 1] === "\n"
+			) {
 				i++;
 			}
 
@@ -140,33 +173,54 @@ function splitRecords(text: string): {
 	}
 
 	return {
-		records,
+		lines,
 		remainder: text.slice(start),
 	};
 }
 
-function rowFromRecord(
-	record: string,
+function rowsFromLines(
+	lines: string[],
 	headers: string[],
-): FeedRow {
-	const values = parseCsvRecord(record);
-	const row: FeedRow = {};
+): FeedRow[] {
+	const rows: FeedRow[] = [];
 
-	for (let i = 0; i < headers.length; i++) {
-		row[headers[i]] = values[i] ?? "";
+	for (const line of lines) {
+		if (!line.trim()) {
+			continue;
+		}
+
+		const values = parseCsvLine(line);
+		const row: FeedRow = {};
+
+		for (
+			let i = 0;
+			i < headers.length;
+			i++
+		) {
+			row[headers[i]] =
+				values[i] ?? "";
+		}
+
+		rows.push(row);
 	}
 
-	return row;
+	return rows;
 }
 
-function getMpid(row: FeedRow): string {
+function getMerchantProductId(
+	row: FeedRow,
+): string {
 	return (
-		normalize(row.merchant_product_id) ||
+		normalize(
+			row.merchant_product_id,
+		) ||
 		normalize(row.aw_product_id)
 	);
 }
 
-function getEan(row: FeedRow): string | null {
+function getEan(
+	row: FeedRow,
+): string | null {
 	const value =
 		normalize(row.product_GTIN) ||
 		normalize(row.ean);
@@ -174,70 +228,112 @@ function getEan(row: FeedRow): string | null {
 	return value || null;
 }
 
-function getName(row: FeedRow): string {
+function getName(
+	row: FeedRow,
+): string {
 	return (
-		normalize(row.product_short_description) ||
+		normalize(
+			row.product_short_description,
+		) ||
 		normalize(row.product_name) ||
 		normalize(row.description) ||
 		"Unbekanntes Produkt"
 	);
 }
 
-function getBrand(row: FeedRow): string | null {
-	const value = normalize(row.brand_name);
-	return value || null;
-}
-
-function getCategory(row: FeedRow): string | null {
-	const value = normalize(row.merchant_category);
-	return value || null;
-}
-
-function getProductUrl(row: FeedRow): string | null {
+function getBrand(
+	row: FeedRow,
+): string | null {
 	const value =
-		normalize(row.merchant_deep_link) ||
+		normalize(row.brand_name);
+
+	return value || null;
+}
+
+function getCategory(
+	row: FeedRow,
+): string | null {
+	const value =
+		normalize(row.merchant_category);
+
+	return value || null;
+}
+
+function getProductUrl(
+	row: FeedRow,
+): string | null {
+	const value =
+		normalize(
+			row.merchant_deep_link,
+		) ||
 		normalize(row.aw_deep_link);
 
 	return value || null;
 }
 
-function getAffiliateUrl(row: FeedRow): string | null {
-	const value = normalize(row.aw_deep_link);
+function getAffiliateUrl(
+	row: FeedRow,
+): string | null {
+	const value =
+		normalize(row.aw_deep_link);
+
 	return value || null;
 }
 
-function getImageUrl(row: FeedRow): string | null {
+function getImageUrl(
+	row: FeedRow,
+): string | null {
 	const value =
-		normalize(row.merchant_image_url) ||
+		normalize(
+			row.merchant_image_url,
+		) ||
 		normalize(row.aw_image_url);
 
 	return value || null;
 }
 
-function getCurrency(row: FeedRow): string {
-	return normalize(row.currency) || "EUR";
+function getCurrency(
+	row: FeedRow,
+): string {
+	return (
+		normalize(row.currency) ||
+		"EUR"
+	);
 }
 
-function getUpdated(row: FeedRow): string | null {
-	const value = normalize(row.last_updated);
+function getSourceUpdatedAt(
+	row: FeedRow,
+): string | null {
+	const value =
+		normalize(row.last_updated);
+
 	return value || null;
 }
 
-function canonicalKey(row: FeedRow): string {
+function canonicalKey(
+	row: FeedRow,
+): string {
 	const ean = getEan(row);
-	const mpid = getMpid(row);
 
-	return ean
-		? `ean:${ean}`
-		: `merchant-product:${mpid}`;
+	if (ean) {
+		return `ean:${ean}`;
+	}
+
+	return `merchant-product:${getMerchantProductId(
+		row,
+	)}`;
 }
 
-function isDogProduct(row: FeedRow): boolean {
+function isDogProduct(
+	row: FeedRow,
+): boolean {
 	const category = [
 		row.merchant_category,
 		row.merchant_product_category_path,
 		row.category_name,
-	].join(" ");
+	]
+		.join(" ")
+		.toLowerCase();
 
 	const text = [
 		row.product_short_description,
@@ -245,66 +341,83 @@ function isDogProduct(row: FeedRow): boolean {
 		row.description,
 		row.product_type,
 		row.keywords,
-	].join(" ");
+	]
+		.join(" ")
+		.toLowerCase();
 
-	if (
-		/\b(katze|katzen|cat|feline|katzenfutter)\b/i.test(
+	const catDog =
+		/(^|>|\s)(hund|hunde|dog|canine)(\s|>|$)/i.test(
 			category,
-		)
-	) {
-		return false;
-	}
+		);
 
-	if (
-		/\b(hund|hunde|dog|canine)\b/i.test(category) ||
-		/\b(hundefutter|hundesnack|hundesnacks|kauartikel|kausnack|kausnacks|leckerli|trockenfutter|nassfutter|barf)\b/i.test(
-			text,
-		)
-	) {
+	const catCat =
+		/(^|>|\s)(katze|katzen|cat|feline)(\s|>|$)/i.test(
+			category,
+		);
+
+	if (catDog && !catCat) {
 		return true;
 	}
 
-	return false;
+	if (catCat && !catDog) {
+		return false;
+	}
+
+	return (
+		/\b(hund|hunde|dog|canine|puppy|welpe|hundefutter|hundesnack|hundesnacks|kausnack|kauartikel|trockenfutter|nassfutter|barf)\b/i.test(
+			text,
+		) &&
+		!/\b(katzenfutter|katzenstreu|katzenbedarf|cat food)\b/i.test(
+			text,
+		)
+	);
 }
 
 async function findFeed(
 	env: Env,
 ): Promise<FeedSource> {
-	const objects: R2Object[] = [];
+	const feeds: R2Object[] = [];
 
 	let cursor: string | undefined;
 
 	do {
-		const page = await env.FEED_BUCKET.list({
-			prefix: FEED_PREFIX,
-			limit: 1000,
-			...(cursor ? { cursor } : {}),
-		});
+		const page =
+			await env.FEED_BUCKET.list({
+				prefix: FEED_PREFIX,
+				limit: 1000,
+				...(cursor
+					? { cursor }
+					: {}),
+			});
 
-		objects.push(
-			...page.objects.filter((o) =>
-				o.key.toLowerCase().endsWith(".csv"),
-			),
-		);
+		for (const object of page.objects) {
+			if (
+				object.key
+					.toLowerCase()
+					.endsWith(".csv")
+			) {
+				feeds.push(object);
+			}
+		}
 
 		cursor = page.truncated
 			? page.cursor
 			: undefined;
 	} while (cursor);
 
-	objects.sort(
-		(a, b) =>
+	feeds.sort(
+		(a: R2Object, b: R2Object) =>
 			b.uploaded.getTime() -
 			a.uploaded.getTime(),
 	);
 
-	const feed = objects[0];
-
-	if (!feed) {
+	if (feeds.length === 0) {
 		throw new Error(
-			"Kein Fressnapf-CSV-Feed gefunden.",
+			"Kein Fressnapf-CSV-Feed in R2 gefunden.",
 		);
 	}
+
+	const feed = feeds[0];
 
 	return {
 		key: feed.key,
@@ -315,119 +428,150 @@ async function findFeed(
 
 async function readHeader(
 	env: Env,
-	source: FeedSource,
-): Promise<{
-	headers: string[];
-	offset: number;
-}> {
-	const object = await env.FEED_BUCKET.get(
-		source.key,
-		{
-			range: {
-				offset: 0,
-				length: CHUNK_SIZE,
+	key: string,
+): Promise<Header> {
+	const object =
+		await env.FEED_BUCKET.get(
+			key,
+			{
+				range: {
+					offset: 0,
+					length: CHUNK_SIZE,
+				},
 			},
-		},
-	);
+		);
 
-	if (!object) {
+	if (
+		!object ||
+		!("body" in object) ||
+		!object.body
+	) {
 		throw new Error(
 			"CSV-Header konnte nicht gelesen werden.",
 		);
 	}
 
-	const bytes = new Uint8Array(
-		await object.arrayBuffer(),
-	);
+	const bytes =
+		new Uint8Array(
+			await object.arrayBuffer(),
+		);
 
-	let quoted = false;
-	let newline = -1;
+	const newlineByte =
+		bytes.indexOf(0x0a);
 
-	for (let i = 0; i < bytes.length; i++) {
-		if (bytes[i] === 34) {
-			if (quoted && bytes[i + 1] === 34) {
-				i++;
-			} else {
-				quoted = !quoted;
-			}
-		} else if (
-			bytes[i] === 10 &&
-			!quoted
-		) {
-			newline = i;
-			break;
-		}
-	}
-
-	if (newline < 0) {
+	if (newlineByte < 0) {
 		throw new Error(
-			"CSV-Header nicht gefunden.",
+			"CSV enthält keine Kopfzeile.",
 		);
 	}
 
-	let headerBytes = bytes.slice(0, newline);
+	let headerLine =
+		new TextDecoder(
+			"utf-8",
+			{
+				fatal: true,
+				ignoreBOM: false,
+			},
+		).decode(
+			bytes.slice(
+				0,
+				newlineByte,
+			),
+		);
+
+	headerLine =
+		headerLine.replace(
+			/\r$/,
+			"",
+		);
 
 	if (
-		headerBytes.length > 0 &&
-		headerBytes[headerBytes.length - 1] === 13
+		headerLine.charCodeAt(0) ===
+		0xfeff
 	) {
-		headerBytes = headerBytes.slice(0, -1);
+		headerLine =
+			headerLine.slice(1);
 	}
 
-	const header = new TextDecoder("utf-8", {
-		fatal: true,
-		ignoreBOM: false,
-	}).decode(headerBytes);
+	const headers =
+		parseCsvLine(
+			headerLine,
+		).map(
+			(value) =>
+				value.trim(),
+		);
+
+	if (headers.length < 2) {
+		throw new Error(
+			"CSV-Header ist ungültig.",
+		);
+	}
 
 	return {
-		headers: parseCsvRecord(
-			header.replace(/^\uFEFF/, ""),
-		).map((v) => v.trim()),
-		offset: newline + 1,
+		headers,
+		offset:
+			newlineByte + 1,
 	};
 }
 
-function prepareRows(
-	rows: FeedRow[],
-): DbRow[] {
-	const map = new Map<string, DbRow>();
+function stateKey(
+	instanceId: string,
+): string {
+	return `workflow-state/fressnapf/${instanceId}.txt`;
+}
 
-	for (const row of rows) {
-		const mpid = getMpid(row);
-
-		if (!mpid) continue;
-
-		const price = moneyToCents(
-			row.search_price ||
-				row.display_price,
+async function readRemainder(
+	env: Env,
+	instanceId: string,
+): Promise<string> {
+	const object =
+		await env.FEED_BUCKET.get(
+			stateKey(instanceId),
 		);
 
-		if (price <= 0) continue;
-
-		const shipping = moneyToCents(
-			row.delivery_cost,
-		);
-
-		map.set(mpid, {
-			key: canonicalKey(row),
-			ean: getEan(row),
-			brand: getBrand(row),
-			name: getName(row),
-			category: getCategory(row),
-			mpid,
-			url: getProductUrl(row),
-			affiliate: getAffiliateUrl(row),
-			image: getImageUrl(row),
-			currency: getCurrency(row),
-			price,
-			shipping,
-			total: price + shipping,
-			available: isAvailable(row.in_stock),
-			updated: getUpdated(row),
-		});
+	if (!object) {
+		return "";
 	}
 
-	return Array.from(map.values());
+	return object.text();
+}
+
+async function writeRemainder(
+	env: Env,
+	instanceId: string,
+	remainder: string,
+): Promise<void> {
+	const bytes =
+		new TextEncoder().encode(
+			remainder,
+		);
+
+	if (
+		bytes.byteLength >
+		MAX_REMAINDER_BYTES
+	) {
+		throw new Error(
+			"CSV enthält eine einzelne Zeile, die größer als der zulässige Chunk-Puffer ist.",
+		);
+	}
+
+	if (remainder.length === 0) {
+		await env.FEED_BUCKET.delete(
+			stateKey(instanceId),
+		);
+		return;
+	}
+
+	await env.FEED_BUCKET.put(
+		stateKey(instanceId),
+		bytes,
+		{
+			httpMetadata: {
+				contentType:
+					"text/plain; charset=utf-8",
+			},
+		},
+	);
 }
 
 async function processChunk(
@@ -435,100 +579,164 @@ async function processChunk(
 	source: FeedSource,
 	merchantId: number,
 	headers: string[],
-	offset: number,
-	remainder: string,
-): Promise<{
-	nextOffset: number;
-	remainder: string;
-	found: number;
-	imported: number;
-	done: boolean;
-}> {
-	const object = await env.FEED_BUCKET.get(
-		source.key,
-		{
-			range: {
-				offset,
-				length: Math.min(
-					CHUNK_SIZE,
-					source.size - offset,
-				),
+	instanceId: string,
+	currentOffset: number,
+): Promise<ChunkResult> {
+	const object =
+		await env.FEED_BUCKET.get(
+			source.key,
+			{
+				range: {
+					offset:
+						currentOffset,
+					length:
+						CHUNK_SIZE,
+				},
+				onlyIf: {
+					etagMatches:
+						source.etag,
+				},
 			},
-		},
-	);
+		);
 
-	if (!object) {
+	if (
+		!object ||
+		!("body" in object) ||
+		!object.body
+	) {
 		throw new Error(
-			`Feed konnte bei Offset ${offset} nicht gelesen werden.`,
+			`R2-Feed konnte bei Offset ${currentOffset} nicht gelesen werden oder wurde während des Imports geändert.`,
 		);
 	}
 
-	const bytes = new Uint8Array(
-		await object.arrayBuffer(),
-	);
+	const bytes =
+		new Uint8Array(
+			await object.arrayBuffer(),
+		);
 
-	if (!bytes.length) {
+	if (bytes.byteLength === 0) {
 		throw new Error(
-			`Leerer Feed-Chunk bei Offset ${offset}.`,
+			`R2-Feed lieferte bei Offset ${currentOffset} keine Daten.`,
 		);
 	}
 
-	let text = "";
+	const remainder =
+		await readRemainder(
+			env,
+			instanceId,
+		);
 
-	let decoded = false;
-
-	for (let trim = 0; trim <= 3; trim++) {
-		try {
-			text = new TextDecoder("utf-8", {
+	const decoder =
+		new TextDecoder(
+			"utf-8",
+			{
 				fatal: true,
 				ignoreBOM: false,
-			}).decode(
-				bytes.slice(
-					0,
-					bytes.length - trim,
-				),
-			);
+			},
+		);
 
-			decoded = true;
-			break;
-		} catch {
-			// trailing UTF-8 bytes
-		}
-	}
+	let decoded: string;
 
-	if (!decoded) {
+	try {
+		decoded =
+			decoder.decode(bytes);
+	} catch {
 		throw new Error(
-			`UTF-8-Dekodierung bei Offset ${offset} fehlgeschlagen.`,
+			`UTF-8-Dekodierung bei Offset ${currentOffset} fehlgeschlagen.`,
 		);
 	}
 
-	const split = splitRecords(
-		remainder + text,
-	);
+	const combined =
+		remainder + decoded;
 
-	const feedRows: FeedRow[] = [];
+	const split =
+		splitCompleteLines(
+			combined,
+		);
 
-	for (const record of split.records) {
-		if (!record.trim()) continue;
-
-		const row = rowFromRecord(
-			record,
+	const rows =
+		rowsFromLines(
+			split.lines,
 			headers,
 		);
 
-		if (isDogProduct(row)) {
-			feedRows.push(row);
+	const dogRows =
+		rows.filter(
+			isDogProduct,
+		);
+
+	const statements:
+		D1PreparedStatement[] = [];
+
+	let importedChunk = 0;
+
+	for (const row of dogRows) {
+		const merchantProductId =
+			getMerchantProductId(
+				row,
+			);
+
+		if (!merchantProductId) {
+			continue;
 		}
-	}
 
-	const rows = prepareRows(feedRows);
+		const priceCents =
+			cents(
+				row.search_price ||
+					row.display_price,
+			);
 
-	if (rows.length > 0) {
-		const json = JSON.stringify(rows);
+		if (priceCents <= 0) {
+			continue;
+		}
 
-		await env.DB.batch([
-			env.DB.prepare(`
-				INSERT INTO products (
+		const shippingCents =
+			cents(
+				row.delivery_cost,
+			);
+
+		const totalPriceCents =
+			priceCents +
+			shippingCents;
+
+		const isAvailable =
+			available(
+				row.in_stock,
+			);
+
+		const ean =
+			getEan(row);
+
+		const key =
+			canonicalKey(row);
+
+		const productName =
+			getName(row);
+
+		const brand =
+			getBrand(row);
+
+		const category =
+			getCategory(row);
+
+		const productUrl =
+			getProductUrl(row);
+
+		const affiliateUrl =
+			getAffiliateUrl(row);
+
+		const imageUrl =
+			getImageUrl(row);
+
+		const currency =
+			getCurrency(row);
+
+		const sourceUpdatedAt =
+			getSourceUpdatedAt(row);
+
+		statements.push(
+			env.DB.prepare(
+				`INSERT INTO products (
 					canonical_key,
 					ean_gtin,
 					brand,
@@ -537,22 +745,19 @@ async function processChunk(
 					category
 				)
 				SELECT
-					json_extract(value, '$.key'),
-					NULLIF(
-						json_extract(value, '$.ean'),
-						''
-					),
-					NULLIF(
-						json_extract(value, '$.brand'),
-						''
-					),
-					json_extract(value, '$.name'),
+					?,
+					?,
+					?,
+					?,
 					'dog',
-					NULLIF(
-						json_extract(value, '$.category'),
-						''
-					)
-				FROM json_each(?)
+					?
+				WHERE NOT EXISTS (
+					SELECT 1
+					FROM products
+					WHERE ean_gtin = ?
+					AND ean_gtin IS NOT NULL
+					AND ean_gtin <> ''
+				)
 				ON CONFLICT(canonical_key)
 				DO UPDATE SET
 					ean_gtin =
@@ -575,11 +780,45 @@ async function processChunk(
 							products.category
 						),
 					updated_at =
-						CURRENT_TIMESTAMP
-			`).bind(json),
+						CURRENT_TIMESTAMP`,
+			).bind(
+				key,
+				ean,
+				brand,
+				productName,
+				category,
+				ean,
+			),
+		);
 
-			env.DB.prepare(`
-				INSERT INTO merchant_products (
+		if (ean) {
+			statements.push(
+				env.DB.prepare(
+					`UPDATE products
+					 SET
+						brand = ?,
+						name = ?,
+						animal_type = 'dog',
+						category =
+							COALESCE(
+								?,
+								category
+							),
+						updated_at =
+							CURRENT_TIMESTAMP
+					 WHERE ean_gtin = ?`,
+				).bind(
+					brand,
+					productName,
+					category,
+					ean,
+				),
+			);
+		}
+
+		statements.push(
+			env.DB.prepare(
+				`INSERT INTO merchant_products (
 					merchant_id,
 					product_id,
 					merchant_product_id,
@@ -590,45 +829,35 @@ async function processChunk(
 					image_url,
 					currency
 				)
-				SELECT
+				VALUES (
 					?,
-					p.id,
-					json_extract(j.value, '$.mpid'),
-					NULLIF(
-						json_extract(j.value, '$.ean'),
-						''
+					(
+						SELECT id
+						FROM products
+						WHERE
+							(
+								ean_gtin = ?
+								AND ean_gtin IS NOT NULL
+								AND ean_gtin <> ''
+							)
+							OR canonical_key = ?
+						ORDER BY
+							CASE
+								WHEN ean_gtin = ?
+								THEN 0
+								ELSE 1
+							END
+						LIMIT 1
 					),
-					json_extract(j.value, '$.name'),
-					NULLIF(
-						json_extract(j.value, '$.url'),
-						''
-					),
-					NULLIF(
-						json_extract(j.value, '$.affiliate'),
-						''
-					),
-					NULLIF(
-						json_extract(j.value, '$.image'),
-						''
-					),
-					COALESCE(
-						NULLIF(
-							json_extract(
-								j.value,
-								'$.currency'
-							),
-							''
-						),
-						'EUR'
-					)
-				FROM json_each(?) j
-				JOIN products p
-					ON p.canonical_key =
-						json_extract(
-							j.value,
-							'$.key'
-						)
-				ON CONFLICT (
+					?,
+					?,
+					?,
+					?,
+					?,
+					?,
+					?
+				)
+				ON CONFLICT(
 					merchant_id,
 					merchant_product_id
 				)
@@ -636,7 +865,10 @@ async function processChunk(
 					product_id =
 						excluded.product_id,
 					ean_gtin =
-						excluded.ean_gtin,
+						COALESCE(
+							excluded.ean_gtin,
+							merchant_products.ean_gtin
+						),
 					product_name =
 						excluded.product_name,
 					product_url =
@@ -648,14 +880,25 @@ async function processChunk(
 					currency =
 						excluded.currency,
 					updated_at =
-						CURRENT_TIMESTAMP
-			`).bind(
+						CURRENT_TIMESTAMP`,
+			).bind(
 				merchantId,
-				json,
+				ean,
+				key,
+				ean,
+				merchantProductId,
+				ean,
+				productName,
+				productUrl,
+				affiliateUrl,
+				imageUrl,
+				currency,
 			),
+		);
 
-			env.DB.prepare(`
-				INSERT INTO offers (
+		statements.push(
+			env.DB.prepare(
+				`INSERT INTO offers (
 					merchant_product_id,
 					price_cents,
 					shipping_cents,
@@ -663,49 +906,22 @@ async function processChunk(
 					available,
 					source_updated_at
 				)
-				SELECT
-					mp.id,
-					CAST(
-						json_extract(
-							j.value,
-							'$.price'
-						) AS INTEGER
+				VALUES (
+					(
+						SELECT id
+						FROM merchant_products
+						WHERE
+							merchant_id = ?
+							AND merchant_product_id = ?
+						LIMIT 1
 					),
-					CAST(
-						json_extract(
-							j.value,
-							'$.shipping'
-						) AS INTEGER
-					),
-					CAST(
-						json_extract(
-							j.value,
-							'$.total'
-						) AS INTEGER
-					),
-					CAST(
-						json_extract(
-							j.value,
-							'$.available'
-						) AS INTEGER
-					),
-					NULLIF(
-						json_extract(
-							j.value,
-							'$.updated'
-						),
-						''
-					)
-				FROM json_each(?) j
-				JOIN merchant_products mp
-					ON
-						mp.merchant_id = ?
-						AND mp.merchant_product_id =
-							json_extract(
-								j.value,
-								'$.mpid'
-							)
-				ON CONFLICT (
+					?,
+					?,
+					?,
+					?,
+					?
+				)
+				ON CONFLICT(
 					merchant_product_id
 				)
 				DO UPDATE SET
@@ -720,261 +936,278 @@ async function processChunk(
 					source_updated_at =
 						excluded.source_updated_at,
 					checked_at =
-						CURRENT_TIMESTAMP
-			`).bind(
-				json,
+						CURRENT_TIMESTAMP`,
+			).bind(
 				merchantId,
+				merchantProductId,
+				priceCents,
+				shippingCents,
+				totalPriceCents,
+				isAvailable,
+				sourceUpdatedAt,
 			),
+		);
 
-			env.DB.prepare(`
-				INSERT INTO price_history (
-					merchant_product_id,
-					price_cents,
-					shipping_cents,
-					total_price_cents,
-					available,
-					recorded_at
-				)
-				SELECT
-					mp.id,
-					CAST(
-						json_extract(
-							j.value,
-							'$.price'
-						) AS INTEGER
-					),
-					CAST(
-						json_extract(
-							j.value,
-							'$.shipping'
-						) AS INTEGER
-					),
-					CAST(
-						json_extract(
-							j.value,
-							'$.total'
-						) AS INTEGER
-					),
-					CAST(
-						json_extract(
-							j.value,
-							'$.available'
-						) AS INTEGER
-					),
-					CURRENT_TIMESTAMP
-				FROM json_each(?) j
-				JOIN merchant_products mp
-					ON
-						mp.merchant_id = ?
-						AND mp.merchant_product_id =
-							json_extract(
-								j.value,
-								'$.mpid'
-							)
-				WHERE NOT EXISTS (
-					SELECT 1
-					FROM price_history h
-					WHERE
-						h.merchant_product_id =
-							mp.id
-						AND h.price_cents =
-							CAST(
-								json_extract(
-									j.value,
-									'$.price'
-								) AS INTEGER
-							)
-						AND h.shipping_cents =
-							CAST(
-								json_extract(
-									j.value,
-									'$.shipping'
-								) AS INTEGER
-							)
-						AND h.total_price_cents =
-							CAST(
-								json_extract(
-									j.value,
-									'$.total'
-								) AS INTEGER
-							)
-						AND h.available =
-							CAST(
-								json_extract(
-									j.value,
-									'$.available'
-								) AS INTEGER
-							)
-						AND h.recorded_at >=
-							datetime(
-								'now',
-								'-1 hour'
-							)
-				)
-			`).bind(
-				json,
-				merchantId,
-			),
-		]);
+
+		importedChunk++;
 	}
 
-	const nextOffset = Math.min(
-		source.size,
-		offset + bytes.length,
+	for (
+		let i = 0;
+		i < statements.length;
+		i += DB_BATCH_SIZE
+	) {
+		const batch =
+			statements.slice(
+				i,
+				i + DB_BATCH_SIZE,
+			);
+
+		if (batch.length > 0) {
+			await env.DB.batch(
+				batch,
+			);
+		}
+	}
+
+	await writeRemainder(
+		env,
+		instanceId,
+		split.remainder,
 	);
+
+	const nextOffset =
+		Math.min(
+			source.size,
+			currentOffset +
+				bytes.byteLength,
+		);
+
+	const done =
+		nextOffset >= source.size &&
+		split.remainder.length === 0;
+
+	if (
+		done &&
+		remainder.length > 0 &&
+		split.lines.length === 0
+	) {
+		throw new Error(
+			"CSV endet mit einem unvollständigen Datensatz.",
+		);
+	}
 
 	return {
 		nextOffset,
-		remainder: split.remainder,
-		found: feedRows.length,
-		imported: rows.length,
-		done:
-			nextOffset >= source.size &&
-			split.remainder.length === 0,
+		found: dogRows.length,
+		imported: importedChunk,
+		matched: importedChunk,
+		done,
 	};
 }
 
-export class MyWorkflow extends WorkflowEntrypoint<Env> {
+export class MyWorkflow
+	extends WorkflowEntrypoint<Env> {
 	async run(
-		event: any,
-		step: any,
+		event: WorkflowEvent<
+			Record<string, unknown>
+		>,
+		step: WorkflowStep,
 	) {
-		const source = await step.do(
-			"find Fressnapf feed",
-			() => findFeed(this.env),
-		);
+		const instanceId =
+			event.instanceId;
 
-		const merchant = await step.do(
-			"find Fressnapf merchant",
-			async () => {
-				const result =
-					await this.env.DB
-						.prepare(`
-							SELECT id, name
-							FROM merchants
-							WHERE name LIKE ?
-							LIMIT 1
-						`)
-						.bind("%Fressnapf%")
-						.first<{
-							id: number;
-							name: string;
-						}>();
+		const source =
+			await step.do(
+				"find Fressnapf feed",
+				async (): Promise<FeedSource> =>
+					findFeed(this.env),
+			);
 
-				if (!result) {
-					throw new Error(
-						"Fressnapf wurde nicht gefunden.",
-					);
-				}
-
-				return result;
-			},
-		);
-
-		const importId = await step.do(
-			"create import",
-			async () => {
-				const result =
-					await this.env.DB
-						.prepare(`
-							INSERT INTO imports (
-								merchant_id,
-								source_name,
-								status
+		const merchant =
+			await step.do(
+				"find Fressnapf merchant",
+				async (): Promise<{
+					id: number;
+					name: string;
+				}> => {
+					const result =
+						await this.env.DB
+							.prepare(
+								`SELECT
+									id,
+									name
+								FROM merchants
+								WHERE name LIKE ?
+								LIMIT 1`,
 							)
-							VALUES (?, ?, 'running')
-							RETURNING id
-						`)
-						.bind(
-							merchant.id,
-							SOURCE_NAME,
-						)
-						.first<{
-							id: number;
-						}>();
+							.bind(
+								"%Fressnapf%",
+							)
+							.first<{
+								id: number;
+								name: string;
+							}>();
 
-				if (!result?.id) {
-					throw new Error(
-						"Import konnte nicht erstellt werden.",
-					);
-				}
+					if (!result) {
+						throw new Error(
+							"Fressnapf-Merchant wurde in D1 nicht gefunden.",
+						);
+					}
 
-				return result.id;
-			},
-		);
+					return result;
+				},
+			);
 
-		try {
-			const header = await step.do(
+		const importId =
+			await step.do(
+				"create import record",
+				async (): Promise<number> => {
+					const result =
+						await this.env.DB
+							.prepare(
+								`INSERT INTO imports (
+									merchant_id,
+									source_name,
+									status,
+									products_found,
+									products_imported,
+									products_matched
+								)
+								VALUES (
+									?,
+									?,
+									'running',
+									0,
+									0,
+									0
+								)
+								RETURNING id`,
+							)
+							.bind(
+								merchant.id,
+								SOURCE_NAME,
+							)
+							.first<{
+								id: number;
+							}>();
+
+					if (!result?.id) {
+						throw new Error(
+							"Import-Datensatz konnte nicht erstellt werden.",
+						);
+					}
+
+					return result.id;
+				},
+			);
+
+		const header =
+			await step.do(
 				"read CSV header",
-				() =>
+				async (): Promise<Header> =>
 					readHeader(
 						this.env,
-						source,
+						source.key,
 					),
 			);
 
-			let offset = header.offset;
-			let remainder = "";
-			let totalFound = 0;
-			let totalImported = 0;
-			let chunk = 0;
+		let offset =
+			header.offset;
 
+		let productsFound = 0;
+		let productsImported = 0;
+		let productsMatched = 0;
+		let chunkNumber = 0;
+
+		try {
 			while (
-				offset < source.size ||
-				remainder.length > 0
+				offset < source.size
 			) {
-				const result = await step.do(
-					`import chunk ${chunk + 1}`,
-					() =>
-						processChunk(
-							this.env,
-							source,
-							merchant.id,
-							header.headers,
-							offset,
-							remainder,
-						),
-				);
+				const currentOffset: number =
+					offset;
+
+				const currentChunkNumber: number =
+					chunkNumber + 1;
+
+				const result: ChunkResult =
+					await step.do(
+						`process Fressnapf chunk ${currentChunkNumber}`,
+						async (): Promise<ChunkResult> =>
+							processChunk(
+								this.env,
+								source,
+								merchant.id,
+								header.headers,
+								instanceId,
+								currentOffset,
+							),
+					);
 
 				if (
-					result.nextOffset <= offset &&
+					result.nextOffset <=
+						currentOffset &&
 					!result.done
 				) {
 					throw new Error(
-						`Import-Fortschritt steht bei Offset ${offset}.`,
+						`Feed-Import macht keinen Fortschritt bei Offset ${currentOffset}.`,
 					);
 				}
 
-				offset = result.nextOffset;
-				remainder = result.remainder;
+				offset =
+					result.nextOffset;
 
-				totalFound += result.found;
-				totalImported += result.imported;
+				productsFound +=
+					result.found;
 
-				chunk++;
+				productsImported +=
+					result.imported;
 
-				await step.do(
-					`update import progress ${chunk}`,
-					async () => {
-						await this.env.DB
-							.prepare(`
-								UPDATE imports
-								SET
-									products_found = ?,
-									products_imported = ?,
-									products_matched = ?
-								WHERE id = ?
-									AND status = 'running'
-							`)
-							.bind(
-								totalFound,
-								totalImported,
-								totalImported,
-								importId,
-							)
-							.run();
-					},
-				);
+				productsMatched +=
+					result.matched;
+
+				chunkNumber =
+					currentChunkNumber;
+
+				if (
+					result.done ||
+					chunkNumber %
+						PROGRESS_EVERY_CHUNKS ===
+						0
+				) {
+					const progressFound =
+						productsFound;
+
+					const progressImported =
+						productsImported;
+
+					const progressMatched =
+						productsMatched;
+
+					await step.do(
+						`save progress ${chunkNumber}`,
+						async (): Promise<void> => {
+							await this.env.DB
+								.prepare(
+									`UPDATE imports
+									 SET
+										products_found = ?,
+										products_imported = ?,
+										products_matched = ?
+									 WHERE
+										id = ?
+										AND status = 'running'`,
+								)
+								.bind(
+									progressFound,
+									progressImported,
+									progressMatched,
+									importId,
+								)
+								.run();
+						},
+					);
+				}
 
 				if (result.done) {
 					break;
@@ -983,11 +1216,11 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 
 			await step.do(
 				"complete import",
-				async () => {
+				async (): Promise<void> => {
 					await this.env.DB
-						.prepare(`
-							UPDATE imports
-							SET
+						.prepare(
+							`UPDATE imports
+							 SET
 								status = 'completed',
 								products_found = ?,
 								products_imported = ?,
@@ -995,24 +1228,35 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 								finished_at =
 									CURRENT_TIMESTAMP,
 								error_message = NULL
-							WHERE id = ?
-						`)
+							 WHERE id = ?`,
+						)
 						.bind(
-							totalFound,
-							totalImported,
-							totalImported,
+							productsFound,
+							productsImported,
+							productsMatched,
 							importId,
 						)
 						.run();
+
+					await this.env.FEED_BUCKET.delete(
+						stateKey(instanceId),
+					);
 				},
 			);
 
 			return {
 				success: true,
+				instanceId,
 				importId,
-				chunks: chunk,
-				productsFound: totalFound,
-				productsImported: totalImported,
+				merchant:
+					merchant.name,
+				feed:
+					source.key,
+				productsFound,
+				productsImported,
+				productsMatched,
+				chunks:
+					chunkNumber,
 			};
 		} catch (error) {
 			const message =
@@ -1020,18 +1264,26 @@ export class MyWorkflow extends WorkflowEntrypoint<Env> {
 					? error.message
 					: String(error);
 
-			await this.env.DB
-				.prepare(`
-					UPDATE imports
-					SET
-						status = 'failed',
-						finished_at =
-							CURRENT_TIMESTAMP,
-						error_message = ?
-					WHERE id = ?
-				`)
-				.bind(message, importId)
-				.run();
+			await step.do(
+				"mark import failed",
+				async (): Promise<void> => {
+					await this.env.DB
+						.prepare(
+							`UPDATE imports
+							 SET
+								status = 'failed',
+								finished_at =
+									CURRENT_TIMESTAMP,
+								error_message = ?
+							 WHERE id = ?`,
+						)
+						.bind(
+							message,
+							importId,
+						)
+						.run();
+				},
+			);
 
 			throw error;
 		}
