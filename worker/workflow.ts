@@ -498,18 +498,138 @@ async function downloadMeraFeed(
 	const key =
 		"feeds/mera/mera.csv";
 
-	await env.FEED_BUCKET.put(
-		key,
-		body,
-		{
-			httpMetadata: {
-				contentType:
-					"text/csv; charset=utf-8",
+	const multipart =
+		await env.FEED_BUCKET.createMultipartUpload(
+			key,
+			{
+				httpMetadata: {
+					contentType:
+						"text/csv; charset=utf-8",
+				},
 			},
-		},
-	);
+		);
 
-	return key;
+	const PART_SIZE =
+		10 * 1024 * 1024;
+
+	const parts: R2UploadedPart[] = [];
+
+	let partNumber = 1;
+
+	let buffered =
+		new Uint8Array(0);
+
+	const append =
+		(
+			a: Uint8Array,
+			b: Uint8Array,
+		): Uint8Array => {
+			const result =
+				new Uint8Array(
+					a.length +
+						b.length,
+				);
+
+			result.set(a, 0);
+
+			result.set(
+				b,
+				a.length,
+			);
+
+			return result;
+		};
+
+	try {
+		const bodyReader =
+			body.getReader();
+
+		while (true) {
+			const chunk =
+				await bodyReader.read();
+
+			if (chunk.done) {
+				break;
+			}
+
+			if (
+				!chunk.value ||
+				chunk.value.length === 0
+			) {
+				continue;
+			}
+
+			buffered =
+				append(
+					buffered,
+					chunk.value,
+				);
+
+			while (
+				buffered.length >=
+				PART_SIZE
+			) {
+				const partData =
+					buffered.slice(
+						0,
+						PART_SIZE,
+					);
+
+				buffered =
+					buffered.slice(
+						PART_SIZE,
+					);
+
+				const uploaded =
+					await multipart.uploadPart(
+						partNumber,
+						partData,
+					);
+
+				parts.push(
+					uploaded,
+				);
+
+				partNumber++;
+			}
+		}
+
+		if (
+			buffered.length > 0
+		) {
+			const uploaded =
+				await multipart.uploadPart(
+					partNumber,
+					buffered,
+				);
+
+			parts.push(
+				uploaded,
+			);
+		}
+
+		if (
+			parts.length === 0
+		) {
+			throw new Error(
+				"MERA Feed ist leer.",
+			);
+		}
+
+		await multipart.complete(
+			parts,
+		);
+
+		return key;
+	} catch (error) {
+		try {
+			await multipart.abort();
+		} catch {
+			// Best-effort cleanup.
+		}
+
+		throw error;
+	}
 }
 
 async function findFeed(
