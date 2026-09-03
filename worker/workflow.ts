@@ -9,8 +9,37 @@ interface Env {
 	FEED_BUCKET: R2Bucket;
 }
 
-const SOURCE_NAME = "Haustierkost Awin Feed";
-const FEED_PREFIX = "feeds/haustierkost/";
+type MerchantConfig = {
+	key: string;
+	merchantPattern: string;
+	sourceName: string;
+	feedPrefix: string;
+	label: string;
+};
+
+const MERCHANTS: Record<string, MerchantConfig> = {
+	fressnapf: {
+		key: "fressnapf",
+		merchantPattern: "%Fressnapf%",
+		sourceName: "Fressnapf Awin Feed",
+		feedPrefix: "feeds/fressnapf/",
+		label: "Fressnapf",
+	},
+	haustierkost: {
+		key: "haustierkost",
+		merchantPattern: "%Haustierkost%",
+		sourceName: "Haustierkost Awin Feed",
+		feedPrefix: "feeds/haustierkost/",
+		label: "Haustierkost",
+	},
+	mera: {
+		key: "mera",
+		merchantPattern: "%MERA%",
+		sourceName: "MERA Awin Feed",
+		feedPrefix: "feeds/mera/",
+		label: "MERA",
+	},
+};
 
 const CHUNK_SIZE = 256 * 1024;
 const DB_BATCH_SIZE = 50;
@@ -375,6 +404,7 @@ function isDogProduct(
 
 async function findFeed(
 	env: Env,
+	config: MerchantConfig,
 ): Promise<FeedSource> {
 	const feeds: R2Object[] = [];
 
@@ -383,7 +413,7 @@ async function findFeed(
 	do {
 		const page =
 			await env.FEED_BUCKET.list({
-				prefix: FEED_PREFIX,
+				prefix: config.feedPrefix,
 				limit: 1000,
 				...(cursor
 					? { cursor }
@@ -413,7 +443,7 @@ async function findFeed(
 
 	if (feeds.length === 0) {
 		throw new Error(
-			"Kein Haustierkost-CSV-Feed in R2 gefunden.",
+			`Kein ${config.label}-CSV-Feed in R2 gefunden.`,
 		);
 	}
 
@@ -948,7 +978,6 @@ async function processChunk(
 			),
 		);
 
-
 		importedChunk++;
 	}
 
@@ -1017,16 +1046,33 @@ export class MyWorkflow
 		const instanceId =
 			event.instanceId;
 
+		const payload =
+			event.payload as Record<string, unknown>;
+
+		const requestedMerchant =
+			typeof payload?.merchant === "string"
+				? payload.merchant.toLowerCase().trim()
+				: "fressnapf";
+
+		const config =
+			MERCHANTS[requestedMerchant];
+
+		if (!config) {
+			throw new Error(
+				`Unbekannter Merchant "${requestedMerchant}". Erlaubt sind: ${Object.keys(MERCHANTS).join(", ")}.`,
+			);
+		}
+
 		const source =
 			await step.do(
-				"find Haustierkost feed",
+				`find ${config.label} feed`,
 				async (): Promise<FeedSource> =>
-					findFeed(this.env),
+					findFeed(this.env, config),
 			);
 
 		const merchant =
 			await step.do(
-				"find Haustierkost merchant",
+				`find ${config.label} merchant`,
 				async (): Promise<{
 					id: number;
 					name: string;
@@ -1037,13 +1083,11 @@ export class MyWorkflow
 								`SELECT
 									id,
 									name
-								FROM merchants
-								WHERE name LIKE ?
-								LIMIT 1`,
+								 FROM merchants
+								 WHERE name LIKE ?
+								 LIMIT 1`,
 							)
-							.bind(
-								"%Haustierkost%",
-							)
+							.bind(config.merchantPattern)
 							.first<{
 								id: number;
 								name: string;
@@ -1051,7 +1095,7 @@ export class MyWorkflow
 
 					if (!result) {
 						throw new Error(
-							"Haustierkost-Merchant wurde in D1 nicht gefunden.",
+							`${config.label}-Merchant wurde in D1 nicht gefunden.`,
 						);
 					}
 
@@ -1086,7 +1130,7 @@ export class MyWorkflow
 							)
 							.bind(
 								merchant.id,
-								SOURCE_NAME,
+								config.sourceName,
 							)
 							.first<{
 								id: number;
@@ -1132,7 +1176,7 @@ export class MyWorkflow
 
 				const result: ChunkResult =
 					await step.do(
-						`process Haustierkost chunk ${currentChunkNumber}`,
+						`process ${config.label} chunk ${currentChunkNumber}`,
 						async (): Promise<ChunkResult> =>
 							processChunk(
 								this.env,
