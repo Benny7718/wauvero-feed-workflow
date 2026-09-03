@@ -424,212 +424,62 @@ async function downloadMeraFeed(
 		},
 	);
 
-	if (
-		!response.ok ||
-		!response.body
-	) {
+	if (!response.ok) {
 		throw new Error(
 			`MERA Feed konnte nicht geladen werden (HTTP ${response.status}).`,
 		);
 	}
 
-	const reader =
-		response.body.getReader();
+	const raw = new Uint8Array(
+		await response.arrayBuffer(),
+	);
 
-	const first =
-		await reader.read();
-
-	const firstChunk =
-		first.value ||
-		new Uint8Array();
+	if (raw.length === 0) {
+		throw new Error(
+			"MERA Feed wurde leer geladen.",
+		);
+	}
 
 	const isGzip =
-		firstChunk.length >= 2 &&
-		firstChunk[0] === 0x1f &&
-		firstChunk[1] === 0x8b;
+		raw.length >= 2 &&
+		raw[0] === 0x1f &&
+		raw[1] === 0x8b;
 
-	let firstPending = true;
+	let csvData = raw;
 
-	const source =
-		new ReadableStream<Uint8Array>({
-			async pull(controller) {
-				if (firstPending) {
-					firstPending = false;
-
-					if (firstChunk.length) {
-						controller.enqueue(
-							firstChunk,
-						);
-					}
-
-					if (first.done) {
-						controller.close();
-					}
-
-					return;
-				}
-
-				const next =
-					await reader.read();
-
-				if (next.done) {
-					controller.close();
-				} else if (next.value) {
-					controller.enqueue(
-						next.value,
-					);
-				}
-			},
-
-			cancel(reason) {
-				return reader.cancel(reason);
-			},
-		});
-
-	const body =
-		isGzip
-			? source.pipeThrough(
-					new DecompressionStream(
-						"gzip",
-					),
-				)
-			: source;
-
-	const key =
-		"feeds/mera/mera.csv";
-
-	const multipart =
-		await env.FEED_BUCKET.createMultipartUpload(
-			key,
-			{
-				httpMetadata: {
-					contentType:
-						"text/csv; charset=utf-8",
-				},
-			},
-		);
-
-	const PART_SIZE =
-		10 * 1024 * 1024;
-
-	const parts: R2UploadedPart[] = [];
-
-	let partNumber = 1;
-
-	let buffered =
-		new Uint8Array(0);
-
-	const append =
-		(
-			a: Uint8Array,
-			b: Uint8Array,
-		): Uint8Array => {
-			const result =
-				new Uint8Array(
-					a.length +
-						b.length,
-				);
-
-			result.set(a, 0);
-
-			result.set(
-				b,
-				a.length,
+	if (isGzip) {
+		const decompressedStream =
+			new Response(raw).body?.pipeThrough(
+				new DecompressionStream("gzip"),
 			);
 
-			return result;
-		};
-
-	try {
-		const bodyReader =
-			body.getReader();
-
-		while (true) {
-			const chunk =
-				await bodyReader.read();
-
-			if (chunk.done) {
-				break;
-			}
-
-			if (
-				!chunk.value ||
-				chunk.value.length === 0
-			) {
-				continue;
-			}
-
-			buffered =
-				append(
-					buffered,
-					chunk.value,
-				);
-
-			while (
-				buffered.length >=
-				PART_SIZE
-			) {
-				const partData =
-					buffered.slice(
-						0,
-						PART_SIZE,
-					);
-
-				buffered =
-					buffered.slice(
-						PART_SIZE,
-					);
-
-				const uploaded =
-					await multipart.uploadPart(
-						partNumber,
-						partData,
-					);
-
-				parts.push(
-					uploaded,
-				);
-
-				partNumber++;
-			}
-		}
-
-		if (
-			buffered.length > 0
-		) {
-			const uploaded =
-				await multipart.uploadPart(
-					partNumber,
-					buffered,
-				);
-
-			parts.push(
-				uploaded,
-			);
-		}
-
-		if (
-			parts.length === 0
-		) {
+		if (!decompressedStream) {
 			throw new Error(
-				"MERA Feed ist leer.",
+				"MERA Feed konnte nicht entpackt werden.",
 			);
 		}
 
-		await multipart.complete(
-			parts,
+		csvData = new Uint8Array(
+			await new Response(
+				decompressedStream,
+			).arrayBuffer(),
 		);
-
-		return key;
-	} catch (error) {
-		try {
-			await multipart.abort();
-		} catch {
-			// Best-effort cleanup.
-		}
-
-		throw error;
 	}
+
+	const key = "feeds/mera/mera.csv";
+
+	await env.FEED_BUCKET.put(
+		key,
+		csvData,
+		{
+			httpMetadata: {
+			contentType:
+				"text/csv; charset=utf-8",
+			},
+		},
+	);
+
+	return key;
 }
 
 async function findFeed(
@@ -638,24 +488,19 @@ async function findFeed(
 ): Promise<FeedSource> {
 	const feeds: R2Object[] = [];
 
-	let cursor:
-		| string
-		| undefined;
+	let cursor: string | undefined;
 
 	do {
 		const page =
 			await env.FEED_BUCKET.list({
-				prefix:
-					config.feedPrefix,
+				prefix: config.feedPrefix,
 				limit: 1000,
 				...(cursor
 					? { cursor }
 					: {}),
 			});
 
-		for (
-			const object of page.objects
-		) {
+		for (const object of page.objects) {
 			if (
 				object.key
 					.toLowerCase()
@@ -665,10 +510,9 @@ async function findFeed(
 			}
 		}
 
-		cursor =
-			page.truncated
-				? page.cursor
-				: undefined;
+		cursor = page.truncated
+			? page.cursor
+			: undefined;
 	} while (cursor);
 
 	feeds.sort(
@@ -683,8 +527,7 @@ async function findFeed(
 		);
 	}
 
-	const feed =
-		feeds[0];
+	const feed = feeds[0];
 
 	return {
 		key: feed.key,
@@ -703,8 +546,7 @@ async function readHeader(
 			{
 				range: {
 					offset: 0,
-					length:
-						CHUNK_SIZE,
+					length: CHUNK_SIZE,
 				},
 			},
 		);
@@ -823,13 +665,10 @@ async function writeRemainder(
 		);
 	}
 
-	if (
-		remainder.length === 0
-	) {
+	if (remainder.length === 0) {
 		await env.FEED_BUCKET.delete(
 			stateKey(instanceId),
 		);
-
 		return;
 	}
 
@@ -885,9 +724,7 @@ async function processChunk(
 			await object.arrayBuffer(),
 		);
 
-	if (
-		bytes.byteLength === 0
-	) {
+	if (bytes.byteLength === 0) {
 		throw new Error(
 			`R2-Feed lieferte bei Offset ${currentOffset} keine Daten.`,
 		);
@@ -943,9 +780,7 @@ async function processChunk(
 
 	let importedChunk = 0;
 
-	for (
-		const row of dogRows
-	) {
+	for (const row of dogRows) {
 		const merchantProductId =
 			getMerchantProductId(
 				row,
@@ -1223,6 +1058,7 @@ async function processChunk(
 			),
 		);
 
+
 		importedChunk++;
 	}
 
@@ -1273,12 +1109,9 @@ async function processChunk(
 
 	return {
 		nextOffset,
-		found:
-			dogRows.length,
-		imported:
-			importedChunk,
-		matched:
-			importedChunk,
+		found: dogRows.length,
+		imported: importedChunk,
+		matched: importedChunk,
 		done,
 	};
 }
@@ -1296,18 +1129,12 @@ export class MyWorkflow
 
 		const payload =
 			event.payload as Record<string, unknown>;
-
 		const requestedMerchant =
 			typeof payload?.merchant === "string"
-				? payload.merchant
-						.toLowerCase()
-						.trim()
+				? payload.merchant.toLowerCase().trim()
 				: "fressnapf";
-
 		const config =
-			MERCHANTS[
-				requestedMerchant
-			];
+			MERCHANTS[requestedMerchant];
 
 		if (!config) {
 			throw new Error(
@@ -1315,16 +1142,11 @@ export class MyWorkflow
 			);
 		}
 
-		if (
-			requestedMerchant ===
-			"mera"
-		) {
+		if (requestedMerchant === "mera") {
 			await step.do(
 				"download MERA feed",
 				async (): Promise<string> =>
-					downloadMeraFeed(
-						this.env,
-					),
+					downloadMeraFeed(this.env),
 			);
 		}
 
@@ -1332,10 +1154,7 @@ export class MyWorkflow
 			await step.do(
 				`find ${config.label} feed`,
 				async (): Promise<FeedSource> =>
-					findFeed(
-						this.env,
-						config,
-					),
+					findFeed(this.env, config),
 			);
 
 		const merchant =
@@ -1345,7 +1164,7 @@ export class MyWorkflow
 					id: number;
 					name: string;
 				}> => {
-					let result =
+					const result =
 						await this.env.DB
 							.prepare(
 								`SELECT
@@ -1355,51 +1174,11 @@ export class MyWorkflow
 								 WHERE name LIKE ?
 								 LIMIT 1`,
 							)
-							.bind(
-								config.merchantPattern,
-							)
+							.bind(config.merchantPattern)
 							.first<{
 								id: number;
 								name: string;
 							}>();
-
-					if (
-						!result &&
-						requestedMerchant ===
-							"mera"
-					) {
-						await this.env.DB
-							.prepare(
-								`INSERT INTO merchants (
-									name
-								)
-								VALUES (?)
-								ON CONFLICT(name)
-								DO NOTHING`,
-							)
-							.bind(
-								"MERA",
-							)
-							.run();
-
-						result =
-							await this.env.DB
-								.prepare(
-									`SELECT
-										id,
-										name
-									 FROM merchants
-									 WHERE name = ?
-									 LIMIT 1`,
-								)
-								.bind(
-									"MERA",
-								)
-								.first<{
-									id: number;
-									name: string;
-								}>();
-					}
 
 					if (!result) {
 						throw new Error(
@@ -1444,9 +1223,7 @@ export class MyWorkflow
 								id: number;
 							}>();
 
-					if (
-						!result?.id
-					) {
+					if (!result?.id) {
 						throw new Error(
 							"Import-Datensatz konnte nicht erstellt werden.",
 						);
@@ -1476,20 +1253,15 @@ export class MyWorkflow
 
 		try {
 			while (
-				offset <
-				source.size
+				offset < source.size
 			) {
-				const currentOffset:
-					number =
+				const currentOffset: number =
 					offset;
 
-				const currentChunkNumber:
-					number =
-					chunkNumber +
-					1;
+				const currentChunkNumber: number =
+					chunkNumber + 1;
 
-				const result:
-					ChunkResult =
+				const result: ChunkResult =
 					await step.do(
 						`process ${config.label} chunk ${currentChunkNumber}`,
 						async (): Promise<ChunkResult> =>
@@ -1568,9 +1340,7 @@ export class MyWorkflow
 					);
 				}
 
-				if (
-					result.done
-				) {
+				if (result.done) {
 					break;
 				}
 			}
@@ -1600,9 +1370,7 @@ export class MyWorkflow
 						.run();
 
 					await this.env.FEED_BUCKET.delete(
-						stateKey(
-							instanceId,
-						),
+						stateKey(instanceId),
 					);
 				},
 			);
@@ -1621,9 +1389,7 @@ export class MyWorkflow
 				chunks:
 					chunkNumber,
 			};
-		} catch (
-			error
-		) {
+		} catch (error) {
 			const message =
 				error instanceof Error
 					? error.message
